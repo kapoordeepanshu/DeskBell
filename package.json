@@ -11,7 +11,7 @@
     "presets": "node scripts/build-presets.mjs",
     "build": "npm run presets && node scripts/build-workflows.mjs",
     "validate": "node scripts/validate-workflows.mjs && node scripts/check-schema.mjs",
-    "test": "node --test tests/",
+    "test": "node --test",
     "import": "node scripts/import-workflows.mjs",
     "check": "npm run build && npm run validate && npm test",
     "verify": "npm run check && git diff --exit-code -- workflows config"
