@@ -1,0 +1,142 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  /* GitHub social preview card — 1280x640, rendered to PNG by
+     scripts/build-social-preview.mjs. Edit here, then `npm run social`. */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --ink:     #0b1020;
+    --ink-2:   #131a30;
+    --brass:   #f5b93f;
+    --brass-d: #d99a1f;
+    --text:    #f2f5fb;
+    --muted:   #8f9dbc;
+    --line:    rgba(255,255,255,.09);
+    --green:   #47d19a;
+  }
+
+  body {
+    width: 1280px; height: 640px; overflow: hidden;
+    background: var(--ink);
+    color: var(--text);
+    font-family: "Segoe UI", Inter, -apple-system, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    position: relative;
+  }
+
+  /* Warm glow behind the bell, so the card has a focal point at thumbnail size */
+  .glow {
+    position: absolute; top: -240px; right: -180px;
+    width: 760px; height: 760px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(245,185,63,.16) 0%, rgba(245,185,63,.05) 42%, transparent 68%);
+  }
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: linear-gradient(115deg, #000 0%, transparent 62%);
+    opacity: .55;
+  }
+
+  .card { position: relative; height: 100%; padding: 62px 72px; display: flex; flex-direction: column; }
+
+  /* ---------- wordmark ---------- */
+  .brand { display: flex; align-items: center; gap: 20px; }
+  .bell {
+    width: 82px; height: 82px; border-radius: 22px; flex: none;
+    background: linear-gradient(160deg, var(--brass) 0%, var(--brass-d) 100%);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 44px; line-height: 1;
+    box-shadow: 0 14px 40px rgba(245,185,63,.28);
+  }
+  h1 { font-size: 68px; font-weight: 700; letter-spacing: -2.2px; line-height: 1; }
+  h1 b { color: var(--brass); font-weight: 700; }
+
+  .tagline {
+    margin-top: 30px;
+    font-size: 41px; font-weight: 600; letter-spacing: -1.1px; line-height: 1.18;
+    max-width: 900px;
+  }
+  .sub {
+    margin-top: 18px;
+    font-size: 25px; font-weight: 400; color: var(--muted); line-height: 1.45;
+    max-width: 830px;
+  }
+  .sub em { color: var(--text); font-style: normal; font-weight: 600; }
+
+  /* ---------- stat row ---------- */
+  .stats { margin-top: auto; display: flex; gap: 14px; }
+  .stat {
+    flex: 1; padding: 20px 24px; border-radius: 16px;
+    background: var(--ink-2); border: 1px solid var(--line);
+  }
+  .stat .n { font-size: 32px; font-weight: 700; letter-spacing: -1px; color: var(--brass); }
+  .stat .l { margin-top: 6px; font-size: 17px; color: var(--muted); line-height: 1.35; }
+
+  /* ---------- footer ---------- */
+  .foot {
+    margin-top: 26px; padding-top: 24px; border-top: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 20px; color: var(--muted);
+  }
+  .chips { display: flex; gap: 10px; }
+  .chip {
+    padding: 7px 15px; border-radius: 999px;
+    background: rgba(255,255,255,.05); border: 1px solid var(--line);
+    font-size: 18px; color: #cbd5ef;
+  }
+  .ok { color: var(--green); font-weight: 600; }
+</style>
+</head>
+<body>
+  <div class="glow"></div>
+  <div class="grid"></div>
+
+  <div class="card">
+    <div class="brand">
+      <div class="bell">🔔</div>
+      <h1>Desk<b>Bell</b></h1>
+    </div>
+
+    <div class="tagline">The front desk that never sleeps.</div>
+    <div class="sub">
+      Open-source <em>no-show</em> &amp; <em>missed-call recovery</em> for n8n.
+      Reminders, text-back, waitlist gap-fill &mdash; for any business that books appointments.
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="n">10&ndash;30%</div>
+        <div class="l">of booked slots lost<br>to no-shows</div>
+      </div>
+      <div class="stat">
+        <div class="n">78%</div>
+        <div class="l">buy from whoever<br>replies first</div>
+      </div>
+      <div class="stat">
+        <div class="n">$40&ndash;300</div>
+        <div class="l">per month, what SaaS<br>charges for this</div>
+      </div>
+      <div class="stat">
+        <div class="n">$0</div>
+        <div class="l">self-hosted, MIT,<br>your data</div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <div class="chips">
+        <span class="chip">WhatsApp</span>
+        <span class="chip">SMS</span>
+        <span class="chip">AI voice</span>
+        <span class="chip">Email</span>
+      </div>
+      <div><span class="ok">63 tests passing</span> &nbsp;·&nbsp; 11 workflows &nbsp;·&nbsp; MIT</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -13,6 +13,7 @@
     "validate": "node scripts/validate-workflows.mjs && node scripts/check-schema.mjs",
     "test": "node --test",
     "import": "node scripts/import-workflows.mjs",
+    "social": "node scripts/build-social-preview.mjs",
     "check": "npm run build && npm run validate && npm test",
     "verify": "npm run check && git diff --exit-code -- workflows config"
   },
