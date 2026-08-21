@@ -67,3 +67,23 @@ if (!existsSync(OUT)) {
 const kb = Math.round(statSync(OUT).size / 1024);
 console.log(`  assets/social-preview.png  (${kb} KB, 1280x640)`);
 if (kb > 1024) console.warn('  warn: GitHub caps social previews at 1 MB.');
+
+// A thumbnail proof at the size this card is actually seen. Social previews are
+// almost never viewed at 1280px — they unfurl at roughly a third of that in
+// Slack, X and LinkedIn. Anything illegible here is illegible in the wild.
+if (process.argv.includes('--thumb')) {
+  const THUMB = join(ROOT, 'assets', 'social-preview.thumb.png');
+  execFileSync(browser, [
+    '--headless', '--disable-gpu', '--hide-scrollbars',
+    '--force-device-scale-factor=0.32',
+    '--window-size=410,205',
+    `--screenshot=${THUMB}`,
+    pathToFileURL(HTML).href,
+  ], { stdio: 'inherit' });
+  console.log('  assets/social-preview.thumb.png  (410x205 legibility proof)');
+}
+
+console.log(
+  '\nGitHub has no API for social previews — upload it by hand:\n' +
+  '  repo -> Settings -> Social preview -> Upload an image',
+);
