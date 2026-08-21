@@ -12,7 +12,7 @@
  * Then: GitHub -> repo Settings -> Social preview -> Upload an image.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -64,9 +64,37 @@ if (!existsSync(OUT)) {
   console.error('Render produced no file.');
   process.exit(1);
 }
+
+/**
+ * Read width/height straight out of the PNG IHDR — the same 8 bytes GitHub's
+ * uploader validates. Trusting the --window-size flag is not the same as
+ * checking what actually landed on disk.
+ */
+function pngSize(file) {
+  const fd = openSync(file, 'r');
+  const buf = Buffer.alloc(24);
+  readSync(fd, buf, 0, 24, 0);
+  closeSync(fd);
+  if (buf.subarray(0, 8).toString('binary') !== '\x89PNG\r\n\x1a\n') {
+    throw new Error(`${file} is not a PNG`);
+  }
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+const { width, height } = pngSize(OUT);
 const kb = Math.round(statSync(OUT).size / 1024);
-console.log(`  assets/social-preview.png  (${kb} KB, 1280x640)`);
-if (kb > 1024) console.warn('  warn: GitHub caps social previews at 1 MB.');
+console.log(`  assets/social-preview.png  (${width}x${height}, ${kb} KB)`);
+
+// GitHub rejects anything under 640x320 or over 1 MB. Fail here rather than
+// letting someone discover it in the upload dialog.
+const problems = [];
+if (width < 640 || height < 320) problems.push(`too small: ${width}x${height}, GitHub needs at least 640x320`);
+if (width !== 1280 || height !== 640) problems.push(`not the recommended 1280x640 (got ${width}x${height})`);
+if (kb > 1024) problems.push(`too large: ${kb} KB, GitHub caps social previews at 1 MB`);
+if (problems.length) {
+  for (const p of problems) console.error(`  FAIL  ${p}`);
+  process.exit(1);
+}
 
 // A thumbnail proof at the size this card is actually seen. Social previews are
 // almost never viewed at 1280px — they unfurl at roughly a third of that in
