@@ -1,0 +1,94 @@
+# deskbell — self-hosted stack.
+#
+#   cp .env.example .env    # fill in your provider keys
+#   docker compose up -d    # n8n on http://localhost:5678
+#   npm run import          # push the workflows into it
+#
+# One Postgres instance, two schemas: `n8n` for n8n's own state, `deskbell` for
+# appointment data. Keeping them apart means you can back up, inspect or migrate
+# your business data without touching n8n internals.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deskbell}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-deskbell}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Applied once, on first boot of an empty volume.
+      - ./data/schema.sql:/docker-entrypoint-initdb.d/10-deskbell-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deskbell} -d ${POSTGRES_DB:-deskbell}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not published by default: only n8n needs to reach it. Uncomment to inspect
+    # the data from your machine with psql or a GUI client.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      # --- n8n state lives in its own schema
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-deskbell}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-deskbell}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: n8n
+
+      # --- access
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      # Providers post webhooks here. Must be publicly reachable in production —
+      # use a tunnel (ngrok/cloudflared) for local testing.
+      WEBHOOK_URL: ${DESKBELL_BASE_URL:-http://localhost:5678}
+      GENERIC_TIMEZONE: ${DESKBELL_TIMEZONE:-UTC}
+      TZ: ${DESKBELL_TIMEZONE:-UTC}
+
+      # --- security
+      # Encrypts stored credentials. Losing this means re-entering every
+      # credential; changing it makes existing ones unreadable.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE:-true}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:?set N8N_BASIC_AUTH_PASSWORD in .env}
+
+      # --- deskbell needs env access inside Code and HTTP nodes
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      # --- housekeeping: without pruning, execution history fills the disk
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_MAX_AGE_HOURS:-336}
+      N8N_RUNNERS_ENABLED: "true"
+
+      # --- provider credentials, read by the workflows via $env
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      VAPI_API_KEY: ${VAPI_API_KEY:-}
+      VAPI_ASSISTANT_ID: ${VAPI_ASSISTANT_ID:-}
+      VAPI_PHONE_NUMBER_ID: ${VAPI_PHONE_NUMBER_ID:-}
+      DESKBELL_FROM_EMAIL: ${DESKBELL_FROM_EMAIL:-}
+      DESKBELL_BASE_URL: ${DESKBELL_BASE_URL:-http://localhost:5678}
+      # Optional: overrides the config baked into workflow 00.
+      DESKBELL_CONFIG: ${DESKBELL_CONFIG:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  postgres_data:
+  n8n_data:

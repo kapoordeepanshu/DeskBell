@@ -1,0 +1,685 @@
+{
+  "name": "deskbell/03 Message Dispatcher",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "219c3f59-54fe-4957-9280-f2c1418e4c1f",
+      "name": "When Called",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "__DESKBELL_WF_00_CONFIG__",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "4ba1a08e-d63d-4148-a665-79afdb78e821",
+      "name": "Get Config",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// deskbell/03 — the compliance chokepoint every message passes through\n// Engine functions below are inlined from lib/core.js by scripts/build-workflows.mjs.\n// Do not edit them here — edit lib/core.js and run `npm run build`.\n/* ------------------------------------------------------------------ *\n * Constants\n * ------------------------------------------------------------------ */\n\nconst STATES = Object.freeze({\n  SCHEDULED: 'scheduled',\n  REMINDED: 'reminded',\n  CONFIRMED: 'confirmed',\n  CANCELLED: 'cancelled',\n  RESCHEDULED: 'rescheduled',\n  COMPLETED: 'completed',\n  NO_SHOW: 'no_show',\n});\n\n/** States from which no further reminder is ever sent. */\nconst TERMINAL_STATES = Object.freeze([\n  STATES.CANCELLED,\n  STATES.RESCHEDULED,\n  STATES.COMPLETED,\n  STATES.NO_SHOW,\n]);\n\nconst INTENTS = Object.freeze({\n  CONFIRM: 'confirm',\n  CANCEL: 'cancel',\n  RESCHEDULE: 'reschedule',\n  STOP: 'stop',\n  START: 'start',\n  HELP: 'help',\n  RATING: 'rating',\n  UNKNOWN: 'unknown',\n});\n\n/* ------------------------------------------------------------------ *\n * Time helpers (timezone-correct, DST-safe via Intl)\n * ------------------------------------------------------------------ */\n\n/** \"21:30\" -> 1290 minutes since local midnight. */\nfunction parseHHMM(value) {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(value || '').trim());\n  if (!m) return null;\n  const h = Number(m[1]);\n  const min = Number(m[2]);\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\n\n/**\n * Wall-clock parts of `date` in `timeZone`.\n * Intl is used rather than manual offset maths so DST transitions are correct.\n */\nfunction zonedParts(date, timeZone) {\n  const d = date instanceof Date ? date : new Date(date);\n  if (Number.isNaN(d.getTime())) throw new TypeError('zonedParts: invalid date');\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: timeZone || 'UTC',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false, weekday: 'short',\n  });\n  const parts = {};\n  for (const p of fmt.formatToParts(d)) parts[p.type] = p.value;\n  // en-CA renders midnight as \"24\" in some runtimes; normalize to 0.\n  const hour = Number(parts.hour) % 24;\n  return {\n    year: Number(parts.year),\n    month: Number(parts.month),\n    day: Number(parts.day),\n    hour,\n    minute: Number(parts.minute),\n    second: Number(parts.second),\n    weekday: parts.weekday,\n    minutesOfDay: hour * 60 + Number(parts.minute),\n    isoDate: `${parts.year}-${parts.month}-${parts.day}`,\n  };\n}\n\n/** Hours from `from` to `to`. Negative when `to` is in the past. */\nfunction hoursBetween(from, to) {\n  return (new Date(to).getTime() - new Date(from).getTime()) / 3_600_000;\n}\n\n/**\n * Is `date` inside the configured quiet window in the business timezone?\n * Handles windows that wrap midnight (21:00 -> 08:00), which is the normal case.\n */\nfunction inQuietHours(date, quietHours, timeZone) {\n  if (!quietHours || quietHours.enabled === false) return false;\n  const start = parseHHMM(quietHours.start);\n  const end = parseHHMM(quietHours.end);\n  if (start === null || end === null || start === end) return false;\n  const nowMin = zonedParts(date, timeZone).minutesOfDay;\n  return start > end\n    ? nowMin >= start || nowMin < end // wraps midnight\n    : nowMin >= start && nowMin < end; // same-day window\n}\n\n/**\n * The first instant at or after `date` whose local wall clock equals the end of\n * quiet hours.\n *\n * A naive \"add N minutes of UTC\" lands an hour off across a DST boundary — on a\n * spring-forward night the local day is only 23 hours long, so the jump\n * overshoots to 09:00. Instead we make a first guess and then converge on the\n * target wall-clock time, which is correct under both DST directions.\n */\nfunction nextOpenWindow(date, quietHours, timeZone) {\n  const d = new Date(date);\n  if (!inQuietHours(d, quietHours, timeZone)) return d;\n  const end = parseHHMM(quietHours.end);\n\n  let deltaMin = end - zonedParts(d, timeZone).minutesOfDay;\n  if (deltaMin <= 0) deltaMin += 1440;\n  let candidate = new Date(d.getTime() + deltaMin * 60_000);\n\n  // Converge on local `end`. Two passes suffice for any real offset; the third\n  // is insurance against a half-hour-offset zone landing on a DST edge.\n  for (let i = 0; i < 3; i++) {\n    let diff = end - zonedParts(candidate, timeZone).minutesOfDay;\n    if (diff === 0) break;\n    // Take the shorter way round so we correct by minutes, not by a whole day.\n    if (diff > 720) diff -= 1440;\n    if (diff < -720) diff += 1440;\n    candidate = new Date(candidate.getTime() + diff * 60_000);\n  }\n  // Correcting backwards must never produce a send in the past.\n  if (candidate <= d) candidate = new Date(candidate.getTime() + 1440 * 60_000);\n  return candidate;\n}\n\n/* ------------------------------------------------------------------ *\n * Idempotency\n * ------------------------------------------------------------------ */\n\n/**\n * Deterministic, human-readable send key.\n *\n * Deliberately not a hash: when a customer complains about a duplicate text you\n * want to read the key in the log and know exactly which appointment and stage\n * produced it. Uniqueness is what matters, not opacity.\n */\nfunction idempotencyKey(appointmentId, stage, discriminator) {\n  const safe = (v) => String(v ?? '').trim().replace(/[|\\s]+/g, '_');\n  const base = `${safe(appointmentId)}|${safe(stage)}`;\n  return discriminator ? `${base}|${safe(discriminator)}` : base;\n}\n\n/* ------------------------------------------------------------------ *\n * Reminder scheduling — the core decision\n * ------------------------------------------------------------------ */\n\n/**\n * Decide which reminder stages are due for one appointment right now.\n *\n * Returns one decision object per configured stage, each carrying an explicit\n * `reason`. Nothing is silently dropped — an unsent reminder always has a\n * recorded cause, which is what makes support calls answerable.\n *\n * @param {object} appointment {id, startAt, status, confirmedAt, value, sentStages[], optedOut}\n * @param {object} config      normalized deskbell config\n * @param {Date|string} now\n * @returns {Array<{stage,due,reason,sendAt,idempotencyKey,channels}>}\n */\nfunction evaluateReminders(appointment, config, now) {\n  const nowDate = new Date(now);\n  const stages = [...(config.reminders || [])].sort((a, b) => b.offsetHours - a.offsetHours);\n  const sent = new Set(appointment.sentStages || []);\n  const status = appointment.status || STATES.SCHEDULED;\n  const hoursOut = hoursBetween(nowDate, appointment.startAt);\n  const minLead = config.business?.minLeadTimeHours ?? 0;\n  const decisions = [];\n\n  for (let i = 0; i < stages.length; i++) {\n    const stage = stages[i];\n    // The floor of this stage's window is the next (tighter) stage's offset.\n    // Without it, a T-7d reminder fires at T-2h whenever a sync ran late and\n    // the customer gets a \"see you in a week\" text two hours before arriving.\n    const floor = i + 1 < stages.length ? stages[i + 1].offsetHours : minLead;\n    const key = idempotencyKey(appointment.id, stage.stage);\n    const decide = (due, reason, sendAt) =>\n      decisions.push({\n        stage: stage.stage,\n        due,\n        reason,\n        sendAt: (sendAt || nowDate).toISOString(),\n        idempotencyKey: key,\n        channels: stage.channels || config.channels?.priority || [],\n        requiresConfirmation: !!stage.requiresConfirmation,\n      });\n\n    if (sent.has(stage.stage)) { decide(false, 'already_sent'); continue; }\n    if (appointment.optedOut) { decide(false, 'opted_out'); continue; }\n    if (TERMINAL_STATES.includes(status)) { decide(false, `terminal_state:${status}`); continue; }\n    if (hoursOut <= minLead) { decide(false, 'too_late'); continue; }\n    if (hoursOut > stage.offsetHours) { decide(false, 'not_yet_due'); continue; }\n    if (hoursOut < floor) { decide(false, 'window_missed'); continue; }\n    if (stage.onlyIfUnconfirmed && status === STATES.CONFIRMED) { decide(false, 'already_confirmed'); continue; }\n\n    if (inQuietHours(nowDate, config.quietHours, config.business?.timezone)) {\n      if (config.quietHours?.strategy === 'drop') { decide(false, 'quiet_hours_drop'); continue; }\n      const sendAt = nextOpenWindow(nowDate, config.quietHours, config.business?.timezone);\n      // Deferring past the appointment itself is pointless — drop instead.\n      if (hoursBetween(sendAt, appointment.startAt) <= minLead) { decide(false, 'quiet_hours_would_expire'); continue; }\n      decide(true, 'quiet_hours_deferred', sendAt);\n      continue;\n    }\n    decide(true, 'due');\n  }\n  return decisions;\n}\n\n/**\n * Should this unconfirmed appointment get a voice call?\n * Gated on ticket value so the engine never spends more on the call than the\n * slot is worth.\n */\nfunction shouldEscalateToVoice(appointment, config, now) {\n  const esc = config.escalation || {};\n  if (!esc.voiceEnabled || config.channels?.voice?.enabled === false) {\n    return { escalate: false, reason: 'voice_disabled' };\n  }\n  const status = appointment.status || STATES.SCHEDULED;\n  if (status === STATES.CONFIRMED) return { escalate: false, reason: 'already_confirmed' };\n  if (TERMINAL_STATES.includes(status)) return { escalate: false, reason: `terminal_state:${status}` };\n  if (appointment.optedOut) return { escalate: false, reason: 'opted_out' };\n  if ((appointment.voiceAttempts || 0) >= (esc.maxVoiceAttempts ?? 1)) {\n    return { escalate: false, reason: 'max_attempts_reached' };\n  }\n  const value = Number(appointment.value ?? config.business?.avgAppointmentValue ?? 0);\n  if (value < (esc.minValueForVoiceCall ?? 0)) return { escalate: false, reason: 'below_value_threshold' };\n\n  const hoursOut = hoursBetween(now, appointment.startAt);\n  if (hoursOut <= 0) return { escalate: false, reason: 'in_the_past' };\n  if (hoursOut > (esc.voiceCallIfUnconfirmedHours ?? 6)) return { escalate: false, reason: 'not_yet_due' };\n  if (inQuietHours(now, config.quietHours, config.business?.timezone)) {\n    return { escalate: false, reason: 'quiet_hours' };\n  }\n  return { escalate: true, reason: 'unconfirmed_and_valuable' };\n}\n\n/* ------------------------------------------------------------------ *\n * Channel selection\n * ------------------------------------------------------------------ */\n\n/**\n * Pick the next channel to try.\n *\n * Order comes from the stage, falling back to the global ladder. A channel is\n * skipped when it is disabled, already failed this attempt, or the contact has\n * no address for it. WhatsApp additionally needs either an open 24h session or\n * an approved template — sending outside that window is a policy violation, not\n * just a failed send.\n */\nfunction pickChannel(candidates, contact, config, opts) {\n  const options = opts || {};\n  const failed = new Set(options.failedChannels || []);\n  const order = (candidates && candidates.length ? candidates : config.channels?.priority) || [];\n  const attempts = [];\n\n  for (const channel of order) {\n    const conf = config.channels?.[channel];\n    if (!conf || conf.enabled === false) { attempts.push({ channel, ok: false, reason: 'channel_disabled' }); continue; }\n    if (failed.has(channel)) { attempts.push({ channel, ok: false, reason: 'already_failed' }); continue; }\n\n    const address = addressFor(channel, contact);\n    if (!address) { attempts.push({ channel, ok: false, reason: 'no_address' }); continue; }\n    if (contact.consent && contact.consent[channel] === false) {\n      attempts.push({ channel, ok: false, reason: 'no_consent_for_channel' });\n      continue;\n    }\n    if (channel === 'whatsapp') {\n      const open = whatsappSessionOpen(contact.lastInboundAt, options.now || new Date(), config);\n      if (!open && !options.templateApproved) {\n        attempts.push({ channel, ok: false, reason: 'whatsapp_session_closed_no_template' });\n        continue;\n      }\n      return { channel, address, mode: open ? 'freeform' : 'template', attempts };\n    }\n    return { channel, address, mode: 'direct', attempts };\n  }\n  return { channel: null, address: null, mode: null, attempts, reason: 'no_channel_available' };\n}\n\nfunction addressFor(channel, contact) {\n  if (!contact) return null;\n  if (channel === 'email') return contact.email || null;\n  if (channel === 'whatsapp') return contact.whatsapp || contact.phone || null;\n  return contact.phone || null; // sms, voice\n}\n\n/** WhatsApp free-form messaging is only allowed inside the 24h customer window. */\nfunction whatsappSessionOpen(lastInboundAt, now, config) {\n  if (!lastInboundAt) return false;\n  const windowHours = config.compliance?.whatsappSessionWindowHours ?? 24;\n  const elapsed = hoursBetween(lastInboundAt, now);\n  return elapsed >= 0 && elapsed < windowHours;\n}\n\n/* ------------------------------------------------------------------ *\n * Consent gate — checked before every outbound message\n * ------------------------------------------------------------------ */\n\n/**\n * The single chokepoint every send passes through.\n *\n * Transactional messages about an appointment the customer actually booked are\n * allowed without marketing consent; anything promotional (recall, reviews) is\n * not. `requireExplicitConsent` tightens even the transactional path.\n */\nfunction consentGate(contact, config, kind) {\n  const c = config.compliance || {};\n  if (!contact) return { allowed: false, reason: 'no_contact' };\n  if (contact.optedOut) return { allowed: false, reason: 'opted_out' };\n\n  const promotional = kind === 'marketing' || kind === 'recall' || kind === 'review';\n  if (promotional && contact.marketingConsent !== true) {\n    return { allowed: false, reason: 'no_marketing_consent' };\n  }\n  if (c.requireExplicitConsent && contact.consentAt == null && !promotional) {\n    return { allowed: false, reason: 'no_recorded_consent' };\n  }\n  return { allowed: true, reason: promotional ? 'marketing_consent_present' : 'transactional' };\n}\n\n/* ------------------------------------------------------------------ *\n * Templating\n * ------------------------------------------------------------------ */\n\n/**\n * Render {{placeholders}}. Unknown keys resolve to '' rather than leaking a raw\n * \"{{firstName}}\" into a customer's inbox.\n */\nfunction renderTemplate(template, vars) {\n  return String(template ?? '').replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (_, path) => {\n    const value = path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), vars);\n    return value == null ? '' : String(value);\n  });\n}\n\n/** Append the opt-out footer once, and only where policy needs it. */\nfunction withOptOutFooter(body, config, channel) {\n  const c = config.compliance || {};\n  if (!c.includeOptOutFooter) return body;\n  if (channel === 'email' || channel === 'voice') return body;\n  const footer = (config.templates?.optOutFooter || ' Reply STOP to opt out.').trim();\n  return body.toUpperCase().includes('STOP') ? body : `${body.trim()} ${footer}`;\n}\n\n/* ------------------------------------------------------------------ *\n * Inbound intent classification\n * ------------------------------------------------------------------ */\n\n/**\n * Classify an inbound reply without an LLM.\n *\n * Compliance keywords are matched first and are absolute: \"STOP\" must opt the\n * customer out even if the rest of the message is chatty. Everything else is\n * word-boundary matched so \"notebook\" is never read as \"no\".\n *\n * Returns confidence so the caller can route low-confidence text to AI or a human.\n */\nfunction classifyIntent(text, config) {\n  const raw = String(text ?? '').trim();\n  if (!raw) return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n  const upper = raw.toUpperCase();\n  const c = config.compliance || {};\n\n  const keywordHit = (list) =>\n    (list || []).find((k) => new RegExp(`\\\\b${escapeRegex(String(k).toUpperCase())}\\\\b`).test(upper));\n\n  const stop = keywordHit(c.stopKeywords);\n  if (stop) return { intent: INTENTS.STOP, confidence: 1, matched: stop };\n  const start = keywordHit(c.startKeywords);\n  if (start) return { intent: INTENTS.START, confidence: 1, matched: start };\n  const help = keywordHit(c.helpKeywords);\n  if (help) return { intent: INTENTS.HELP, confidence: 1, matched: help };\n\n  // A bare 1-5 is a rating reply to the post-visit survey.\n  const rating = /^([1-5])(\\s*\\/\\s*5)?$/.exec(raw);\n  if (rating) return { intent: INTENTS.RATING, confidence: 1, rating: Number(rating[1]), matched: rating[0] };\n\n  const patterns = [\n    [INTENTS.RESCHEDULE, /\\b(reschedul\\w*|change|move|shift|postpone|another time|different time|new time)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(cancel|can'?t make it|cannot make it|not coming|won'?t be able|unable to come)\\b/i, 0.95],\n    [INTENTS.CONFIRM, /\\b(yes|y|yep|yeah|yup|confirm\\w*|ok|okay|sure|coming|i'?ll be there|see you)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(no|n|nope|nah)\\b/i, 0.75],\n  ];\n  for (const [intent, re, confidence] of patterns) {\n    const m = re.exec(raw);\n    // A long message that merely contains \"yes\" is not a reliable confirmation.\n    if (m) return { intent, confidence: raw.length > 60 ? confidence - 0.25 : confidence, matched: m[0] };\n  }\n  return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n}\n\nfunction escapeRegex(s) {\n  return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n\n/* ------------------------------------------------------------------ *\n * State machine\n * ------------------------------------------------------------------ */\n\nconst TRANSITIONS = Object.freeze({\n  [STATES.SCHEDULED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.REMINDED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CONFIRMED]: {\n    reminder_sent: STATES.CONFIRMED, // a later reminder must not undo a confirmation\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CANCELLED]: { reply_confirm: STATES.CONFIRMED }, // customer changed their mind\n  [STATES.RESCHEDULED]: {},\n  [STATES.COMPLETED]: {},\n  [STATES.NO_SHOW]: {},\n});\n\n/**\n * Apply an event to an appointment state.\n * Invalid transitions are refused, not thrown — a stray inbound \"yes\" on a\n * completed appointment should be ignored, not page anyone.\n */\nfunction nextState(current, event) {\n  const from = current || STATES.SCHEDULED;\n  const to = TRANSITIONS[from]?.[event];\n  if (!to) return { state: from, changed: false, reason: `invalid_transition:${from}->${event}` };\n  return { state: to, changed: to !== from, reason: `${from}->${to}` };\n}\n\nconst INTENT_TO_EVENT = Object.freeze({\n  [INTENTS.CONFIRM]: 'reply_confirm',\n  [INTENTS.CANCEL]: 'reply_cancel',\n  [INTENTS.RESCHEDULE]: 'reply_reschedule',\n});\n\n/* ------------------------------------------------------------------ *\n * Retry policy\n * ------------------------------------------------------------------ */\n\n/** Split provider failures into retry-worthy and permanent. */\nfunction classifyFailure(statusCode, errorMessage) {\n  const code = Number(statusCode) || 0;\n  const msg = String(errorMessage || '').toLowerCase();\n  if (/invalid|not a valid|unsubscrib|blacklist|opted out|landline|unreachable destination/.test(msg)) {\n    return { retryable: false, category: 'permanent_recipient' };\n  }\n  if (code === 429) return { retryable: true, category: 'rate_limited' };\n  if (code >= 500) return { retryable: true, category: 'provider_error' };\n  if (code === 408 || code === 0) return { retryable: true, category: 'network' };\n  if (code >= 400) return { retryable: false, category: 'bad_request' };\n  return { retryable: false, category: 'unknown' };\n}\n\n/** Backoff for `attempt` (1-based), clamped to the configured ladder. */\nfunction retryDelaySeconds(attempt, config) {\n  const ladder = config.reliability?.retryBackoffSeconds || [30, 300, 1800];\n  return ladder[Math.min(Math.max(attempt, 1) - 1, ladder.length - 1)];\n}\n\n/* ------------------------------------------------------------------ *\n * ROI — the number that keeps this switched on\n * ------------------------------------------------------------------ */\n\n/**\n * Turn the message log into currency.\n *\n * `protectedRevenue` counts only appointments that were unconfirmed, then\n * confirmed after a deskbell reminder — the ones plausibly saved. It deliberately\n * does not claim credit for everything that happened to show up.\n */\nfunction computeRoi(events, config, options) {\n  const opts = options || {};\n  const avg = Number(config.business?.avgAppointmentValue || 0);\n  const noShowRate = Number(opts.baselineNoShowRate ?? 0.2);\n\n  let remindersSent = 0, confirmations = 0, cancellationsRecovered = 0;\n  let missedCallsRecovered = 0, messageCost = 0, slotsRefilled = 0;\n\n  for (const e of events || []) {\n    if (e.type === 'reminder_sent') {\n      remindersSent++;\n      messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n    } else if (e.type === 'confirmed_after_reminder') confirmations++;\n    else if (e.type === 'cancelled_early') cancellationsRecovered++;\n    else if (e.type === 'waitlist_filled') slotsRefilled++;\n    else if (e.type === 'missed_call_recovered') missedCallsRecovered++;\n    else if (e.type === 'message_sent') messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n  }\n\n  // Each confirmation removes roughly one baseline no-show's worth of risk.\n  const protectedRevenue = confirmations * avg * noShowRate;\n  const refilledRevenue = slotsRefilled * avg;\n  const recoveredCallRevenue = missedCallsRecovered * avg;\n  const grossValue = protectedRevenue + refilledRevenue + recoveredCallRevenue;\n\n  return {\n    currency: config.business?.currency || 'USD',\n    remindersSent,\n    confirmations,\n    confirmationRate: remindersSent ? round2(confirmations / remindersSent) : 0,\n    cancellationsRecovered,\n    slotsRefilled,\n    missedCallsRecovered,\n    messageCost: round2(messageCost),\n    protectedRevenue: round2(protectedRevenue),\n    refilledRevenue: round2(refilledRevenue),\n    recoveredCallRevenue: round2(recoveredCallRevenue),\n    netValue: round2(grossValue - messageCost),\n    roiMultiple: messageCost > 0 ? round2(grossValue / messageCost) : null,\n  };\n}\n\nfunction round2(n) {\n  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;\n}\n\n/* ------------------------------------------------------------------ *\n * Normalization\n * ------------------------------------------------------------------ */\n\n/** Coerce an appointment row from any source into the engine's shape. */\nfunction normalizeAppointment(row) {\n  const r = row || {};\n  const startAt = r.startAt || r.start_at || r.start || r.startTime;\n  return {\n    id: String(r.id || r.appointmentId || r.appointment_id || r.uid || ''),\n    externalId: r.externalId || r.external_id || null,\n    startAt: startAt ? new Date(startAt).toISOString() : null,\n    endAt: r.endAt || r.end_at ? new Date(r.endAt || r.end_at).toISOString() : null,\n    status: r.status || STATES.SCHEDULED,\n    confirmedAt: r.confirmedAt || r.confirmed_at || null,\n    serviceName: r.serviceName || r.service_name || r.service || r.summary || 'appointment',\n    value: r.value != null ? Number(r.value) : null,\n    voiceAttempts: Number(r.voiceAttempts || r.voice_attempts || 0),\n    sentStages: parseList(r.sentStages ?? r.sent_stages),\n    optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    contact: {\n      id: String(r.contactId || r.contact_id || r.phone || ''),\n      firstName: r.firstName || r.first_name || (r.name ? String(r.name).split(' ')[0] : '') || '',\n      name: r.name || r.customerName || r.customer_name || '',\n      phone: normalizePhone(r.phone || r.contactPhone || r.contact_phone),\n      whatsapp: normalizePhone(r.whatsapp || r.phone || r.contactPhone),\n      email: r.email || r.contactEmail || r.contact_email || null,\n      petName: r.petName || r.pet_name || null,\n      lastInboundAt: r.lastInboundAt || r.last_inbound_at || null,\n      consentAt: r.consentAt || r.consent_at || null,\n      marketingConsent: r.marketingConsent === true || r.marketing_consent === true ||\n        String(r.marketing_consent).toLowerCase() === 'true',\n      optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    },\n  };\n}\n\nfunction parseList(v) {\n  if (Array.isArray(v)) return v.map(String);\n  if (v == null || v === '') return [];\n  return String(v).split(',').map((s) => s.trim()).filter(Boolean);\n}\n\n/** E.164-ish normalization. Keeps a leading +, strips everything else. */\nfunction normalizePhone(value) {\n  if (!value) return null;\n  const s = String(value).trim();\n  const plus = s.startsWith('+');\n  const digits = s.replace(/\\D/g, '');\n  if (!digits) return null;\n  return plus ? `+${digits}` : digits;\n}\n\n/** Fill in every key the engine reads so no node has to guard for undefined. */\nfunction normalizeConfig(raw) {\n  const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n  cfg.business = cfg.business || {};\n  cfg.business.timezone = cfg.business.timezone || 'UTC';\n  cfg.business.currency = cfg.business.currency || 'USD';\n  cfg.business.minLeadTimeHours = cfg.business.minLeadTimeHours ?? 1;\n  cfg.channels = cfg.channels || {};\n  cfg.channels.priority = cfg.channels.priority || ['sms'];\n  cfg.reminders = Array.isArray(cfg.reminders) ? cfg.reminders : [];\n  cfg.quietHours = cfg.quietHours || { enabled: false };\n  cfg.escalation = cfg.escalation || {};\n  cfg.compliance = cfg.compliance || {};\n  cfg.compliance.stopKeywords = cfg.compliance.stopKeywords || ['STOP'];\n  cfg.compliance.startKeywords = cfg.compliance.startKeywords || ['START'];\n  cfg.compliance.helpKeywords = cfg.compliance.helpKeywords || ['HELP'];\n  cfg.reliability = cfg.reliability || {};\n  cfg.templates = cfg.templates || {};\n  return cfg;\n}\n\n/* ------------------------------------------------------------------ *\n * Exports — Node for tests, globals when inlined into an n8n Code node\n * ------------------------------------------------------------------ */\n\nconst DESKBELL = {\n  STATES, TERMINAL_STATES, INTENTS, TRANSITIONS, INTENT_TO_EVENT,\n  parseHHMM, zonedParts, hoursBetween, inQuietHours, nextOpenWindow,\n  idempotencyKey, evaluateReminders, shouldEscalateToVoice,\n  pickChannel, addressFor, whatsappSessionOpen, consentGate,\n  renderTemplate, withOptOutFooter, classifyIntent, nextState,\n  classifyFailure, retryDelaySeconds, computeRoi,\n  normalizeAppointment, normalizeConfig, normalizePhone,\n};\n\nif (typeof module !== 'undefined' && module.exports) module.exports = DESKBELL;\n// ---------------------------------------------------------------- node logic\n\n\nconst config = $('Get Config').first().json.config;\nconst task = $('When Called').first().json;\nconst now = new Date();\nconst contact = task.contact || {};\n\n// ---- 1. Consent. Nothing routes around this node, which is exactly the point.\nconst gate = consentGate(contact, config, task.kind === 'reminder' ? 'transactional' : (task.kind || 'transactional'));\nif (!gate.allowed) {\n  return [{ json: { allowed: false, blockedReason: gate.reason, sent: false, idempotencyKey: task.idempotencyKey } }];\n}\n\n// ---- 2. Body. Rendered once, reused for every channel attempt so a fallback\n// SMS says the same thing the WhatsApp message would have.\nconst template = config.templates[task.templateKey] || task.body || config.templates.reminder;\nconst vars = { ...task.vars, businessName: config.business.name, bookingUrl: config.business.bookingUrl,\n               supportPhone: config.business.supportPhone, reviewUrl: config.business.reviewUrl };\nconst rendered = renderTemplate(template, vars);\n\n// ---- 3. Channel ladder. Each rung is a full attempt plan; the loop below tries\n// them in order and stops at the first success.\nconst ladder = [];\nconst failed = [];\nfor (let i = 0; i < 4; i++) {\n  const pick = pickChannel(task.channels, contact, config, { now, failedChannels: failed, templateApproved: true });\n  if (!pick.channel) break;\n  ladder.push({\n    channel: pick.channel,\n    address: pick.address,\n    mode: pick.mode,\n    body: withOptOutFooter(rendered, config, pick.channel),\n    cost: config.channels[pick.channel]?.costPerMessage || 0,\n  });\n  failed.push(pick.channel);\n}\n\nif (!ladder.length) {\n  return [{ json: { allowed: false, blockedReason: 'no_channel_available', sent: false, idempotencyKey: task.idempotencyKey } }];\n}\n\nreturn ladder.map((rung, index) => ({\n  json: { allowed: true, attemptIndex: index, isLast: index === ladder.length - 1,\n          idempotencyKey: task.idempotencyKey, kind: task.kind, ...rung, vars },\n}));"
+      },
+      "id": "785cbc59-07a9-420c-88c0-d1605008603e",
+      "name": "Consent Gate & Plan Attempts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6487b9c2-dd3a-4076-924c-d24578f28f14",
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "825e4558-e039-421f-a80b-c6cab60a40c0",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "e5cf2495-2dca-4f27-8a91-bde29dc43785",
+      "name": "Try Each Channel",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1140,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cbd4e583-df09-48cd-97d0-0edaeabe3f3e",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "whatsapp"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "6bd24ec7-9ddf-489a-afae-9e789e9d7408",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "sms",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sms"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "114cd9a4-c47c-4646-a59c-4f18ae129589",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "email"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8c977e61-b7ae-4037-90b5-f4e0f29bcd75",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "voice",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "voice"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "other",
+          "looseTypeValidation": true
+        }
+      },
+      "id": "7572f1cf-7681-48a5-b3a6-06d2af0bb957",
+      "name": "Route Channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1360,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: \"whatsapp\", recipient_type: \"individual\", to: $json.address.replace(\"+\",\"\"), type: \"text\", text: { preview_url: true, body: $json.body } }) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "5b55dbeb-f23c-42bd-ac88-3f5d8a5f3cf6",
+      "name": "Send WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1580,
+        120
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.twilio.com/2010-04-01/Accounts/{{ $env.TWILIO_ACCOUNT_SID }}/Messages.json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "To",
+              "value": "={{ $json.address }}"
+            },
+            {
+              "name": "From",
+              "value": "={{ $env.TWILIO_FROM_NUMBER }}"
+            },
+            {
+              "name": "Body",
+              "value": "={{ $json.body }}"
+            },
+            {
+              "name": "StatusCallback",
+              "value": "={{ $env.DESKBELL_BASE_URL }}/webhook/deskbell/message-status"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "9fa0286f-0689-466a-a225-5dc392a90130",
+      "name": "Send SMS (Twilio)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1580,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.DESKBELL_FROM_EMAIL }}",
+        "toEmail": "={{ $json.address }}",
+        "subject": "={{ $json.vars.businessName }} — your appointment",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {}
+      },
+      "id": "28ea1ed0-d924-4043-98be-ec4c3b5faedd",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1580,
+        400
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "__DESKBELL_WF_06_VOICE__",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {}
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "7818b891-93d5-4c95-8a4d-3f554b17829b",
+      "name": "Place Voice Call",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1580,
+        540
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "id": "2cb81ffa-3922-45ee-9fad-9a05c9d2ccd6",
+      "name": "Collect Attempt",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1800,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// deskbell/03 — did the attempt actually land?\n// Engine functions below are inlined from lib/core.js by scripts/build-workflows.mjs.\n// Do not edit them here — edit lib/core.js and run `npm run build`.\n/* ------------------------------------------------------------------ *\n * Constants\n * ------------------------------------------------------------------ */\n\nconst STATES = Object.freeze({\n  SCHEDULED: 'scheduled',\n  REMINDED: 'reminded',\n  CONFIRMED: 'confirmed',\n  CANCELLED: 'cancelled',\n  RESCHEDULED: 'rescheduled',\n  COMPLETED: 'completed',\n  NO_SHOW: 'no_show',\n});\n\n/** States from which no further reminder is ever sent. */\nconst TERMINAL_STATES = Object.freeze([\n  STATES.CANCELLED,\n  STATES.RESCHEDULED,\n  STATES.COMPLETED,\n  STATES.NO_SHOW,\n]);\n\nconst INTENTS = Object.freeze({\n  CONFIRM: 'confirm',\n  CANCEL: 'cancel',\n  RESCHEDULE: 'reschedule',\n  STOP: 'stop',\n  START: 'start',\n  HELP: 'help',\n  RATING: 'rating',\n  UNKNOWN: 'unknown',\n});\n\n/* ------------------------------------------------------------------ *\n * Time helpers (timezone-correct, DST-safe via Intl)\n * ------------------------------------------------------------------ */\n\n/** \"21:30\" -> 1290 minutes since local midnight. */\nfunction parseHHMM(value) {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(value || '').trim());\n  if (!m) return null;\n  const h = Number(m[1]);\n  const min = Number(m[2]);\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\n\n/**\n * Wall-clock parts of `date` in `timeZone`.\n * Intl is used rather than manual offset maths so DST transitions are correct.\n */\nfunction zonedParts(date, timeZone) {\n  const d = date instanceof Date ? date : new Date(date);\n  if (Number.isNaN(d.getTime())) throw new TypeError('zonedParts: invalid date');\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: timeZone || 'UTC',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false, weekday: 'short',\n  });\n  const parts = {};\n  for (const p of fmt.formatToParts(d)) parts[p.type] = p.value;\n  // en-CA renders midnight as \"24\" in some runtimes; normalize to 0.\n  const hour = Number(parts.hour) % 24;\n  return {\n    year: Number(parts.year),\n    month: Number(parts.month),\n    day: Number(parts.day),\n    hour,\n    minute: Number(parts.minute),\n    second: Number(parts.second),\n    weekday: parts.weekday,\n    minutesOfDay: hour * 60 + Number(parts.minute),\n    isoDate: `${parts.year}-${parts.month}-${parts.day}`,\n  };\n}\n\n/** Hours from `from` to `to`. Negative when `to` is in the past. */\nfunction hoursBetween(from, to) {\n  return (new Date(to).getTime() - new Date(from).getTime()) / 3_600_000;\n}\n\n/**\n * Is `date` inside the configured quiet window in the business timezone?\n * Handles windows that wrap midnight (21:00 -> 08:00), which is the normal case.\n */\nfunction inQuietHours(date, quietHours, timeZone) {\n  if (!quietHours || quietHours.enabled === false) return false;\n  const start = parseHHMM(quietHours.start);\n  const end = parseHHMM(quietHours.end);\n  if (start === null || end === null || start === end) return false;\n  const nowMin = zonedParts(date, timeZone).minutesOfDay;\n  return start > end\n    ? nowMin >= start || nowMin < end // wraps midnight\n    : nowMin >= start && nowMin < end; // same-day window\n}\n\n/**\n * The first instant at or after `date` whose local wall clock equals the end of\n * quiet hours.\n *\n * A naive \"add N minutes of UTC\" lands an hour off across a DST boundary — on a\n * spring-forward night the local day is only 23 hours long, so the jump\n * overshoots to 09:00. Instead we make a first guess and then converge on the\n * target wall-clock time, which is correct under both DST directions.\n */\nfunction nextOpenWindow(date, quietHours, timeZone) {\n  const d = new Date(date);\n  if (!inQuietHours(d, quietHours, timeZone)) return d;\n  const end = parseHHMM(quietHours.end);\n\n  let deltaMin = end - zonedParts(d, timeZone).minutesOfDay;\n  if (deltaMin <= 0) deltaMin += 1440;\n  let candidate = new Date(d.getTime() + deltaMin * 60_000);\n\n  // Converge on local `end`. Two passes suffice for any real offset; the third\n  // is insurance against a half-hour-offset zone landing on a DST edge.\n  for (let i = 0; i < 3; i++) {\n    let diff = end - zonedParts(candidate, timeZone).minutesOfDay;\n    if (diff === 0) break;\n    // Take the shorter way round so we correct by minutes, not by a whole day.\n    if (diff > 720) diff -= 1440;\n    if (diff < -720) diff += 1440;\n    candidate = new Date(candidate.getTime() + diff * 60_000);\n  }\n  // Correcting backwards must never produce a send in the past.\n  if (candidate <= d) candidate = new Date(candidate.getTime() + 1440 * 60_000);\n  return candidate;\n}\n\n/* ------------------------------------------------------------------ *\n * Idempotency\n * ------------------------------------------------------------------ */\n\n/**\n * Deterministic, human-readable send key.\n *\n * Deliberately not a hash: when a customer complains about a duplicate text you\n * want to read the key in the log and know exactly which appointment and stage\n * produced it. Uniqueness is what matters, not opacity.\n */\nfunction idempotencyKey(appointmentId, stage, discriminator) {\n  const safe = (v) => String(v ?? '').trim().replace(/[|\\s]+/g, '_');\n  const base = `${safe(appointmentId)}|${safe(stage)}`;\n  return discriminator ? `${base}|${safe(discriminator)}` : base;\n}\n\n/* ------------------------------------------------------------------ *\n * Reminder scheduling — the core decision\n * ------------------------------------------------------------------ */\n\n/**\n * Decide which reminder stages are due for one appointment right now.\n *\n * Returns one decision object per configured stage, each carrying an explicit\n * `reason`. Nothing is silently dropped — an unsent reminder always has a\n * recorded cause, which is what makes support calls answerable.\n *\n * @param {object} appointment {id, startAt, status, confirmedAt, value, sentStages[], optedOut}\n * @param {object} config      normalized deskbell config\n * @param {Date|string} now\n * @returns {Array<{stage,due,reason,sendAt,idempotencyKey,channels}>}\n */\nfunction evaluateReminders(appointment, config, now) {\n  const nowDate = new Date(now);\n  const stages = [...(config.reminders || [])].sort((a, b) => b.offsetHours - a.offsetHours);\n  const sent = new Set(appointment.sentStages || []);\n  const status = appointment.status || STATES.SCHEDULED;\n  const hoursOut = hoursBetween(nowDate, appointment.startAt);\n  const minLead = config.business?.minLeadTimeHours ?? 0;\n  const decisions = [];\n\n  for (let i = 0; i < stages.length; i++) {\n    const stage = stages[i];\n    // The floor of this stage's window is the next (tighter) stage's offset.\n    // Without it, a T-7d reminder fires at T-2h whenever a sync ran late and\n    // the customer gets a \"see you in a week\" text two hours before arriving.\n    const floor = i + 1 < stages.length ? stages[i + 1].offsetHours : minLead;\n    const key = idempotencyKey(appointment.id, stage.stage);\n    const decide = (due, reason, sendAt) =>\n      decisions.push({\n        stage: stage.stage,\n        due,\n        reason,\n        sendAt: (sendAt || nowDate).toISOString(),\n        idempotencyKey: key,\n        channels: stage.channels || config.channels?.priority || [],\n        requiresConfirmation: !!stage.requiresConfirmation,\n      });\n\n    if (sent.has(stage.stage)) { decide(false, 'already_sent'); continue; }\n    if (appointment.optedOut) { decide(false, 'opted_out'); continue; }\n    if (TERMINAL_STATES.includes(status)) { decide(false, `terminal_state:${status}`); continue; }\n    if (hoursOut <= minLead) { decide(false, 'too_late'); continue; }\n    if (hoursOut > stage.offsetHours) { decide(false, 'not_yet_due'); continue; }\n    if (hoursOut < floor) { decide(false, 'window_missed'); continue; }\n    if (stage.onlyIfUnconfirmed && status === STATES.CONFIRMED) { decide(false, 'already_confirmed'); continue; }\n\n    if (inQuietHours(nowDate, config.quietHours, config.business?.timezone)) {\n      if (config.quietHours?.strategy === 'drop') { decide(false, 'quiet_hours_drop'); continue; }\n      const sendAt = nextOpenWindow(nowDate, config.quietHours, config.business?.timezone);\n      // Deferring past the appointment itself is pointless — drop instead.\n      if (hoursBetween(sendAt, appointment.startAt) <= minLead) { decide(false, 'quiet_hours_would_expire'); continue; }\n      decide(true, 'quiet_hours_deferred', sendAt);\n      continue;\n    }\n    decide(true, 'due');\n  }\n  return decisions;\n}\n\n/**\n * Should this unconfirmed appointment get a voice call?\n * Gated on ticket value so the engine never spends more on the call than the\n * slot is worth.\n */\nfunction shouldEscalateToVoice(appointment, config, now) {\n  const esc = config.escalation || {};\n  if (!esc.voiceEnabled || config.channels?.voice?.enabled === false) {\n    return { escalate: false, reason: 'voice_disabled' };\n  }\n  const status = appointment.status || STATES.SCHEDULED;\n  if (status === STATES.CONFIRMED) return { escalate: false, reason: 'already_confirmed' };\n  if (TERMINAL_STATES.includes(status)) return { escalate: false, reason: `terminal_state:${status}` };\n  if (appointment.optedOut) return { escalate: false, reason: 'opted_out' };\n  if ((appointment.voiceAttempts || 0) >= (esc.maxVoiceAttempts ?? 1)) {\n    return { escalate: false, reason: 'max_attempts_reached' };\n  }\n  const value = Number(appointment.value ?? config.business?.avgAppointmentValue ?? 0);\n  if (value < (esc.minValueForVoiceCall ?? 0)) return { escalate: false, reason: 'below_value_threshold' };\n\n  const hoursOut = hoursBetween(now, appointment.startAt);\n  if (hoursOut <= 0) return { escalate: false, reason: 'in_the_past' };\n  if (hoursOut > (esc.voiceCallIfUnconfirmedHours ?? 6)) return { escalate: false, reason: 'not_yet_due' };\n  if (inQuietHours(now, config.quietHours, config.business?.timezone)) {\n    return { escalate: false, reason: 'quiet_hours' };\n  }\n  return { escalate: true, reason: 'unconfirmed_and_valuable' };\n}\n\n/* ------------------------------------------------------------------ *\n * Channel selection\n * ------------------------------------------------------------------ */\n\n/**\n * Pick the next channel to try.\n *\n * Order comes from the stage, falling back to the global ladder. A channel is\n * skipped when it is disabled, already failed this attempt, or the contact has\n * no address for it. WhatsApp additionally needs either an open 24h session or\n * an approved template — sending outside that window is a policy violation, not\n * just a failed send.\n */\nfunction pickChannel(candidates, contact, config, opts) {\n  const options = opts || {};\n  const failed = new Set(options.failedChannels || []);\n  const order = (candidates && candidates.length ? candidates : config.channels?.priority) || [];\n  const attempts = [];\n\n  for (const channel of order) {\n    const conf = config.channels?.[channel];\n    if (!conf || conf.enabled === false) { attempts.push({ channel, ok: false, reason: 'channel_disabled' }); continue; }\n    if (failed.has(channel)) { attempts.push({ channel, ok: false, reason: 'already_failed' }); continue; }\n\n    const address = addressFor(channel, contact);\n    if (!address) { attempts.push({ channel, ok: false, reason: 'no_address' }); continue; }\n    if (contact.consent && contact.consent[channel] === false) {\n      attempts.push({ channel, ok: false, reason: 'no_consent_for_channel' });\n      continue;\n    }\n    if (channel === 'whatsapp') {\n      const open = whatsappSessionOpen(contact.lastInboundAt, options.now || new Date(), config);\n      if (!open && !options.templateApproved) {\n        attempts.push({ channel, ok: false, reason: 'whatsapp_session_closed_no_template' });\n        continue;\n      }\n      return { channel, address, mode: open ? 'freeform' : 'template', attempts };\n    }\n    return { channel, address, mode: 'direct', attempts };\n  }\n  return { channel: null, address: null, mode: null, attempts, reason: 'no_channel_available' };\n}\n\nfunction addressFor(channel, contact) {\n  if (!contact) return null;\n  if (channel === 'email') return contact.email || null;\n  if (channel === 'whatsapp') return contact.whatsapp || contact.phone || null;\n  return contact.phone || null; // sms, voice\n}\n\n/** WhatsApp free-form messaging is only allowed inside the 24h customer window. */\nfunction whatsappSessionOpen(lastInboundAt, now, config) {\n  if (!lastInboundAt) return false;\n  const windowHours = config.compliance?.whatsappSessionWindowHours ?? 24;\n  const elapsed = hoursBetween(lastInboundAt, now);\n  return elapsed >= 0 && elapsed < windowHours;\n}\n\n/* ------------------------------------------------------------------ *\n * Consent gate — checked before every outbound message\n * ------------------------------------------------------------------ */\n\n/**\n * The single chokepoint every send passes through.\n *\n * Transactional messages about an appointment the customer actually booked are\n * allowed without marketing consent; anything promotional (recall, reviews) is\n * not. `requireExplicitConsent` tightens even the transactional path.\n */\nfunction consentGate(contact, config, kind) {\n  const c = config.compliance || {};\n  if (!contact) return { allowed: false, reason: 'no_contact' };\n  if (contact.optedOut) return { allowed: false, reason: 'opted_out' };\n\n  const promotional = kind === 'marketing' || kind === 'recall' || kind === 'review';\n  if (promotional && contact.marketingConsent !== true) {\n    return { allowed: false, reason: 'no_marketing_consent' };\n  }\n  if (c.requireExplicitConsent && contact.consentAt == null && !promotional) {\n    return { allowed: false, reason: 'no_recorded_consent' };\n  }\n  return { allowed: true, reason: promotional ? 'marketing_consent_present' : 'transactional' };\n}\n\n/* ------------------------------------------------------------------ *\n * Templating\n * ------------------------------------------------------------------ */\n\n/**\n * Render {{placeholders}}. Unknown keys resolve to '' rather than leaking a raw\n * \"{{firstName}}\" into a customer's inbox.\n */\nfunction renderTemplate(template, vars) {\n  return String(template ?? '').replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (_, path) => {\n    const value = path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), vars);\n    return value == null ? '' : String(value);\n  });\n}\n\n/** Append the opt-out footer once, and only where policy needs it. */\nfunction withOptOutFooter(body, config, channel) {\n  const c = config.compliance || {};\n  if (!c.includeOptOutFooter) return body;\n  if (channel === 'email' || channel === 'voice') return body;\n  const footer = (config.templates?.optOutFooter || ' Reply STOP to opt out.').trim();\n  return body.toUpperCase().includes('STOP') ? body : `${body.trim()} ${footer}`;\n}\n\n/* ------------------------------------------------------------------ *\n * Inbound intent classification\n * ------------------------------------------------------------------ */\n\n/**\n * Classify an inbound reply without an LLM.\n *\n * Compliance keywords are matched first and are absolute: \"STOP\" must opt the\n * customer out even if the rest of the message is chatty. Everything else is\n * word-boundary matched so \"notebook\" is never read as \"no\".\n *\n * Returns confidence so the caller can route low-confidence text to AI or a human.\n */\nfunction classifyIntent(text, config) {\n  const raw = String(text ?? '').trim();\n  if (!raw) return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n  const upper = raw.toUpperCase();\n  const c = config.compliance || {};\n\n  const keywordHit = (list) =>\n    (list || []).find((k) => new RegExp(`\\\\b${escapeRegex(String(k).toUpperCase())}\\\\b`).test(upper));\n\n  const stop = keywordHit(c.stopKeywords);\n  if (stop) return { intent: INTENTS.STOP, confidence: 1, matched: stop };\n  const start = keywordHit(c.startKeywords);\n  if (start) return { intent: INTENTS.START, confidence: 1, matched: start };\n  const help = keywordHit(c.helpKeywords);\n  if (help) return { intent: INTENTS.HELP, confidence: 1, matched: help };\n\n  // A bare 1-5 is a rating reply to the post-visit survey.\n  const rating = /^([1-5])(\\s*\\/\\s*5)?$/.exec(raw);\n  if (rating) return { intent: INTENTS.RATING, confidence: 1, rating: Number(rating[1]), matched: rating[0] };\n\n  const patterns = [\n    [INTENTS.RESCHEDULE, /\\b(reschedul\\w*|change|move|shift|postpone|another time|different time|new time)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(cancel|can'?t make it|cannot make it|not coming|won'?t be able|unable to come)\\b/i, 0.95],\n    [INTENTS.CONFIRM, /\\b(yes|y|yep|yeah|yup|confirm\\w*|ok|okay|sure|coming|i'?ll be there|see you)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(no|n|nope|nah)\\b/i, 0.75],\n  ];\n  for (const [intent, re, confidence] of patterns) {\n    const m = re.exec(raw);\n    // A long message that merely contains \"yes\" is not a reliable confirmation.\n    if (m) return { intent, confidence: raw.length > 60 ? confidence - 0.25 : confidence, matched: m[0] };\n  }\n  return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n}\n\nfunction escapeRegex(s) {\n  return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n\n/* ------------------------------------------------------------------ *\n * State machine\n * ------------------------------------------------------------------ */\n\nconst TRANSITIONS = Object.freeze({\n  [STATES.SCHEDULED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.REMINDED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CONFIRMED]: {\n    reminder_sent: STATES.CONFIRMED, // a later reminder must not undo a confirmation\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CANCELLED]: { reply_confirm: STATES.CONFIRMED }, // customer changed their mind\n  [STATES.RESCHEDULED]: {},\n  [STATES.COMPLETED]: {},\n  [STATES.NO_SHOW]: {},\n});\n\n/**\n * Apply an event to an appointment state.\n * Invalid transitions are refused, not thrown — a stray inbound \"yes\" on a\n * completed appointment should be ignored, not page anyone.\n */\nfunction nextState(current, event) {\n  const from = current || STATES.SCHEDULED;\n  const to = TRANSITIONS[from]?.[event];\n  if (!to) return { state: from, changed: false, reason: `invalid_transition:${from}->${event}` };\n  return { state: to, changed: to !== from, reason: `${from}->${to}` };\n}\n\nconst INTENT_TO_EVENT = Object.freeze({\n  [INTENTS.CONFIRM]: 'reply_confirm',\n  [INTENTS.CANCEL]: 'reply_cancel',\n  [INTENTS.RESCHEDULE]: 'reply_reschedule',\n});\n\n/* ------------------------------------------------------------------ *\n * Retry policy\n * ------------------------------------------------------------------ */\n\n/** Split provider failures into retry-worthy and permanent. */\nfunction classifyFailure(statusCode, errorMessage) {\n  const code = Number(statusCode) || 0;\n  const msg = String(errorMessage || '').toLowerCase();\n  if (/invalid|not a valid|unsubscrib|blacklist|opted out|landline|unreachable destination/.test(msg)) {\n    return { retryable: false, category: 'permanent_recipient' };\n  }\n  if (code === 429) return { retryable: true, category: 'rate_limited' };\n  if (code >= 500) return { retryable: true, category: 'provider_error' };\n  if (code === 408 || code === 0) return { retryable: true, category: 'network' };\n  if (code >= 400) return { retryable: false, category: 'bad_request' };\n  return { retryable: false, category: 'unknown' };\n}\n\n/** Backoff for `attempt` (1-based), clamped to the configured ladder. */\nfunction retryDelaySeconds(attempt, config) {\n  const ladder = config.reliability?.retryBackoffSeconds || [30, 300, 1800];\n  return ladder[Math.min(Math.max(attempt, 1) - 1, ladder.length - 1)];\n}\n\n/* ------------------------------------------------------------------ *\n * ROI — the number that keeps this switched on\n * ------------------------------------------------------------------ */\n\n/**\n * Turn the message log into currency.\n *\n * `protectedRevenue` counts only appointments that were unconfirmed, then\n * confirmed after a deskbell reminder — the ones plausibly saved. It deliberately\n * does not claim credit for everything that happened to show up.\n */\nfunction computeRoi(events, config, options) {\n  const opts = options || {};\n  const avg = Number(config.business?.avgAppointmentValue || 0);\n  const noShowRate = Number(opts.baselineNoShowRate ?? 0.2);\n\n  let remindersSent = 0, confirmations = 0, cancellationsRecovered = 0;\n  let missedCallsRecovered = 0, messageCost = 0, slotsRefilled = 0;\n\n  for (const e of events || []) {\n    if (e.type === 'reminder_sent') {\n      remindersSent++;\n      messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n    } else if (e.type === 'confirmed_after_reminder') confirmations++;\n    else if (e.type === 'cancelled_early') cancellationsRecovered++;\n    else if (e.type === 'waitlist_filled') slotsRefilled++;\n    else if (e.type === 'missed_call_recovered') missedCallsRecovered++;\n    else if (e.type === 'message_sent') messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n  }\n\n  // Each confirmation removes roughly one baseline no-show's worth of risk.\n  const protectedRevenue = confirmations * avg * noShowRate;\n  const refilledRevenue = slotsRefilled * avg;\n  const recoveredCallRevenue = missedCallsRecovered * avg;\n  const grossValue = protectedRevenue + refilledRevenue + recoveredCallRevenue;\n\n  return {\n    currency: config.business?.currency || 'USD',\n    remindersSent,\n    confirmations,\n    confirmationRate: remindersSent ? round2(confirmations / remindersSent) : 0,\n    cancellationsRecovered,\n    slotsRefilled,\n    missedCallsRecovered,\n    messageCost: round2(messageCost),\n    protectedRevenue: round2(protectedRevenue),\n    refilledRevenue: round2(refilledRevenue),\n    recoveredCallRevenue: round2(recoveredCallRevenue),\n    netValue: round2(grossValue - messageCost),\n    roiMultiple: messageCost > 0 ? round2(grossValue / messageCost) : null,\n  };\n}\n\nfunction round2(n) {\n  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;\n}\n\n/* ------------------------------------------------------------------ *\n * Normalization\n * ------------------------------------------------------------------ */\n\n/** Coerce an appointment row from any source into the engine's shape. */\nfunction normalizeAppointment(row) {\n  const r = row || {};\n  const startAt = r.startAt || r.start_at || r.start || r.startTime;\n  return {\n    id: String(r.id || r.appointmentId || r.appointment_id || r.uid || ''),\n    externalId: r.externalId || r.external_id || null,\n    startAt: startAt ? new Date(startAt).toISOString() : null,\n    endAt: r.endAt || r.end_at ? new Date(r.endAt || r.end_at).toISOString() : null,\n    status: r.status || STATES.SCHEDULED,\n    confirmedAt: r.confirmedAt || r.confirmed_at || null,\n    serviceName: r.serviceName || r.service_name || r.service || r.summary || 'appointment',\n    value: r.value != null ? Number(r.value) : null,\n    voiceAttempts: Number(r.voiceAttempts || r.voice_attempts || 0),\n    sentStages: parseList(r.sentStages ?? r.sent_stages),\n    optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    contact: {\n      id: String(r.contactId || r.contact_id || r.phone || ''),\n      firstName: r.firstName || r.first_name || (r.name ? String(r.name).split(' ')[0] : '') || '',\n      name: r.name || r.customerName || r.customer_name || '',\n      phone: normalizePhone(r.phone || r.contactPhone || r.contact_phone),\n      whatsapp: normalizePhone(r.whatsapp || r.phone || r.contactPhone),\n      email: r.email || r.contactEmail || r.contact_email || null,\n      petName: r.petName || r.pet_name || null,\n      lastInboundAt: r.lastInboundAt || r.last_inbound_at || null,\n      consentAt: r.consentAt || r.consent_at || null,\n      marketingConsent: r.marketingConsent === true || r.marketing_consent === true ||\n        String(r.marketing_consent).toLowerCase() === 'true',\n      optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    },\n  };\n}\n\nfunction parseList(v) {\n  if (Array.isArray(v)) return v.map(String);\n  if (v == null || v === '') return [];\n  return String(v).split(',').map((s) => s.trim()).filter(Boolean);\n}\n\n/** E.164-ish normalization. Keeps a leading +, strips everything else. */\nfunction normalizePhone(value) {\n  if (!value) return null;\n  const s = String(value).trim();\n  const plus = s.startsWith('+');\n  const digits = s.replace(/\\D/g, '');\n  if (!digits) return null;\n  return plus ? `+${digits}` : digits;\n}\n\n/** Fill in every key the engine reads so no node has to guard for undefined. */\nfunction normalizeConfig(raw) {\n  const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n  cfg.business = cfg.business || {};\n  cfg.business.timezone = cfg.business.timezone || 'UTC';\n  cfg.business.currency = cfg.business.currency || 'USD';\n  cfg.business.minLeadTimeHours = cfg.business.minLeadTimeHours ?? 1;\n  cfg.channels = cfg.channels || {};\n  cfg.channels.priority = cfg.channels.priority || ['sms'];\n  cfg.reminders = Array.isArray(cfg.reminders) ? cfg.reminders : [];\n  cfg.quietHours = cfg.quietHours || { enabled: false };\n  cfg.escalation = cfg.escalation || {};\n  cfg.compliance = cfg.compliance || {};\n  cfg.compliance.stopKeywords = cfg.compliance.stopKeywords || ['STOP'];\n  cfg.compliance.startKeywords = cfg.compliance.startKeywords || ['START'];\n  cfg.compliance.helpKeywords = cfg.compliance.helpKeywords || ['HELP'];\n  cfg.reliability = cfg.reliability || {};\n  cfg.templates = cfg.templates || {};\n  return cfg;\n}\n\n/* ------------------------------------------------------------------ *\n * Exports — Node for tests, globals when inlined into an n8n Code node\n * ------------------------------------------------------------------ */\n\nconst DESKBELL = {\n  STATES, TERMINAL_STATES, INTENTS, TRANSITIONS, INTENT_TO_EVENT,\n  parseHHMM, zonedParts, hoursBetween, inQuietHours, nextOpenWindow,\n  idempotencyKey, evaluateReminders, shouldEscalateToVoice,\n  pickChannel, addressFor, whatsappSessionOpen, consentGate,\n  renderTemplate, withOptOutFooter, classifyIntent, nextState,\n  classifyFailure, retryDelaySeconds, computeRoi,\n  normalizeAppointment, normalizeConfig, normalizePhone,\n};\n\nif (typeof module !== 'undefined' && module.exports) module.exports = DESKBELL;\n// ---------------------------------------------------------------- node logic\n\n\nconst attempt = $('Try Each Channel').first().json;\nconst raw = $input.first().json || {};\n\n// Providers disagree about what success looks like. Normalize before deciding,\n// and treat \"no recognisable success marker\" as failure rather than as success.\nconst status = Number(raw.statusCode ?? raw.status ?? 0);\nconst payload = raw.body ?? raw;\nconst providerId =\n  payload?.messages?.[0]?.id ||   // WhatsApp Cloud\n  payload?.sid ||                 // Twilio\n  payload?.messageId ||           // SMTP node\n  raw.callId || null;             // VAPI\n\nconst twilioFailed = payload?.error_code || ['failed', 'undelivered'].includes(payload?.status);\nconst httpOk = status === 0 ? Boolean(providerId) : status >= 200 && status < 300;\nconst sent = Boolean(httpOk && providerId && !twilioFailed);\n\nconst errorMessage = sent ? null\n  : (payload?.error?.message || payload?.message || raw.error || `http_${status || 'unknown'}`);\nconst failure = sent ? null : classifyFailure(status, errorMessage);\n\nreturn [{\n  json: {\n    ...attempt,\n    sent,\n    providerMessageId: providerId,\n    statusCode: status,\n    error: errorMessage,\n    retryable: failure ? failure.retryable : false,\n    failureCategory: failure ? failure.category : null,\n    // Stop the ladder on success, and also on a permanent recipient failure —\n    // if the number is not a mobile, the next channel using the same number\n    // will fail identically. Burning three attempts to learn that is waste.\n    stopLadder: sent || (failure && failure.category === 'permanent_recipient'),\n  },\n}];"
+      },
+      "id": "a5a8e117-8a02-4c38-b8e6-75747770a0a6",
+      "name": "Evaluate Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2020,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6ef10572-062b-46d4-b75c-6b05eeeb941b",
+              "leftValue": "={{ $json.stopLadder }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "19520015-bcab-4ef8-b262-04ead4104aa1",
+      "name": "Stop Ladder?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        320
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "697aabc5-10ef-49b4-ada6-0002544fcbd1",
+      "name": "Attempt Failed — Next Channel",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// deskbell/03 — single, uniform result for the caller\n// Engine functions below are inlined from lib/core.js by scripts/build-workflows.mjs.\n// Do not edit them here — edit lib/core.js and run `npm run build`.\n/* ------------------------------------------------------------------ *\n * Constants\n * ------------------------------------------------------------------ */\n\nconst STATES = Object.freeze({\n  SCHEDULED: 'scheduled',\n  REMINDED: 'reminded',\n  CONFIRMED: 'confirmed',\n  CANCELLED: 'cancelled',\n  RESCHEDULED: 'rescheduled',\n  COMPLETED: 'completed',\n  NO_SHOW: 'no_show',\n});\n\n/** States from which no further reminder is ever sent. */\nconst TERMINAL_STATES = Object.freeze([\n  STATES.CANCELLED,\n  STATES.RESCHEDULED,\n  STATES.COMPLETED,\n  STATES.NO_SHOW,\n]);\n\nconst INTENTS = Object.freeze({\n  CONFIRM: 'confirm',\n  CANCEL: 'cancel',\n  RESCHEDULE: 'reschedule',\n  STOP: 'stop',\n  START: 'start',\n  HELP: 'help',\n  RATING: 'rating',\n  UNKNOWN: 'unknown',\n});\n\n/* ------------------------------------------------------------------ *\n * Time helpers (timezone-correct, DST-safe via Intl)\n * ------------------------------------------------------------------ */\n\n/** \"21:30\" -> 1290 minutes since local midnight. */\nfunction parseHHMM(value) {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(value || '').trim());\n  if (!m) return null;\n  const h = Number(m[1]);\n  const min = Number(m[2]);\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\n\n/**\n * Wall-clock parts of `date` in `timeZone`.\n * Intl is used rather than manual offset maths so DST transitions are correct.\n */\nfunction zonedParts(date, timeZone) {\n  const d = date instanceof Date ? date : new Date(date);\n  if (Number.isNaN(d.getTime())) throw new TypeError('zonedParts: invalid date');\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: timeZone || 'UTC',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false, weekday: 'short',\n  });\n  const parts = {};\n  for (const p of fmt.formatToParts(d)) parts[p.type] = p.value;\n  // en-CA renders midnight as \"24\" in some runtimes; normalize to 0.\n  const hour = Number(parts.hour) % 24;\n  return {\n    year: Number(parts.year),\n    month: Number(parts.month),\n    day: Number(parts.day),\n    hour,\n    minute: Number(parts.minute),\n    second: Number(parts.second),\n    weekday: parts.weekday,\n    minutesOfDay: hour * 60 + Number(parts.minute),\n    isoDate: `${parts.year}-${parts.month}-${parts.day}`,\n  };\n}\n\n/** Hours from `from` to `to`. Negative when `to` is in the past. */\nfunction hoursBetween(from, to) {\n  return (new Date(to).getTime() - new Date(from).getTime()) / 3_600_000;\n}\n\n/**\n * Is `date` inside the configured quiet window in the business timezone?\n * Handles windows that wrap midnight (21:00 -> 08:00), which is the normal case.\n */\nfunction inQuietHours(date, quietHours, timeZone) {\n  if (!quietHours || quietHours.enabled === false) return false;\n  const start = parseHHMM(quietHours.start);\n  const end = parseHHMM(quietHours.end);\n  if (start === null || end === null || start === end) return false;\n  const nowMin = zonedParts(date, timeZone).minutesOfDay;\n  return start > end\n    ? nowMin >= start || nowMin < end // wraps midnight\n    : nowMin >= start && nowMin < end; // same-day window\n}\n\n/**\n * The first instant at or after `date` whose local wall clock equals the end of\n * quiet hours.\n *\n * A naive \"add N minutes of UTC\" lands an hour off across a DST boundary — on a\n * spring-forward night the local day is only 23 hours long, so the jump\n * overshoots to 09:00. Instead we make a first guess and then converge on the\n * target wall-clock time, which is correct under both DST directions.\n */\nfunction nextOpenWindow(date, quietHours, timeZone) {\n  const d = new Date(date);\n  if (!inQuietHours(d, quietHours, timeZone)) return d;\n  const end = parseHHMM(quietHours.end);\n\n  let deltaMin = end - zonedParts(d, timeZone).minutesOfDay;\n  if (deltaMin <= 0) deltaMin += 1440;\n  let candidate = new Date(d.getTime() + deltaMin * 60_000);\n\n  // Converge on local `end`. Two passes suffice for any real offset; the third\n  // is insurance against a half-hour-offset zone landing on a DST edge.\n  for (let i = 0; i < 3; i++) {\n    let diff = end - zonedParts(candidate, timeZone).minutesOfDay;\n    if (diff === 0) break;\n    // Take the shorter way round so we correct by minutes, not by a whole day.\n    if (diff > 720) diff -= 1440;\n    if (diff < -720) diff += 1440;\n    candidate = new Date(candidate.getTime() + diff * 60_000);\n  }\n  // Correcting backwards must never produce a send in the past.\n  if (candidate <= d) candidate = new Date(candidate.getTime() + 1440 * 60_000);\n  return candidate;\n}\n\n/* ------------------------------------------------------------------ *\n * Idempotency\n * ------------------------------------------------------------------ */\n\n/**\n * Deterministic, human-readable send key.\n *\n * Deliberately not a hash: when a customer complains about a duplicate text you\n * want to read the key in the log and know exactly which appointment and stage\n * produced it. Uniqueness is what matters, not opacity.\n */\nfunction idempotencyKey(appointmentId, stage, discriminator) {\n  const safe = (v) => String(v ?? '').trim().replace(/[|\\s]+/g, '_');\n  const base = `${safe(appointmentId)}|${safe(stage)}`;\n  return discriminator ? `${base}|${safe(discriminator)}` : base;\n}\n\n/* ------------------------------------------------------------------ *\n * Reminder scheduling — the core decision\n * ------------------------------------------------------------------ */\n\n/**\n * Decide which reminder stages are due for one appointment right now.\n *\n * Returns one decision object per configured stage, each carrying an explicit\n * `reason`. Nothing is silently dropped — an unsent reminder always has a\n * recorded cause, which is what makes support calls answerable.\n *\n * @param {object} appointment {id, startAt, status, confirmedAt, value, sentStages[], optedOut}\n * @param {object} config      normalized deskbell config\n * @param {Date|string} now\n * @returns {Array<{stage,due,reason,sendAt,idempotencyKey,channels}>}\n */\nfunction evaluateReminders(appointment, config, now) {\n  const nowDate = new Date(now);\n  const stages = [...(config.reminders || [])].sort((a, b) => b.offsetHours - a.offsetHours);\n  const sent = new Set(appointment.sentStages || []);\n  const status = appointment.status || STATES.SCHEDULED;\n  const hoursOut = hoursBetween(nowDate, appointment.startAt);\n  const minLead = config.business?.minLeadTimeHours ?? 0;\n  const decisions = [];\n\n  for (let i = 0; i < stages.length; i++) {\n    const stage = stages[i];\n    // The floor of this stage's window is the next (tighter) stage's offset.\n    // Without it, a T-7d reminder fires at T-2h whenever a sync ran late and\n    // the customer gets a \"see you in a week\" text two hours before arriving.\n    const floor = i + 1 < stages.length ? stages[i + 1].offsetHours : minLead;\n    const key = idempotencyKey(appointment.id, stage.stage);\n    const decide = (due, reason, sendAt) =>\n      decisions.push({\n        stage: stage.stage,\n        due,\n        reason,\n        sendAt: (sendAt || nowDate).toISOString(),\n        idempotencyKey: key,\n        channels: stage.channels || config.channels?.priority || [],\n        requiresConfirmation: !!stage.requiresConfirmation,\n      });\n\n    if (sent.has(stage.stage)) { decide(false, 'already_sent'); continue; }\n    if (appointment.optedOut) { decide(false, 'opted_out'); continue; }\n    if (TERMINAL_STATES.includes(status)) { decide(false, `terminal_state:${status}`); continue; }\n    if (hoursOut <= minLead) { decide(false, 'too_late'); continue; }\n    if (hoursOut > stage.offsetHours) { decide(false, 'not_yet_due'); continue; }\n    if (hoursOut < floor) { decide(false, 'window_missed'); continue; }\n    if (stage.onlyIfUnconfirmed && status === STATES.CONFIRMED) { decide(false, 'already_confirmed'); continue; }\n\n    if (inQuietHours(nowDate, config.quietHours, config.business?.timezone)) {\n      if (config.quietHours?.strategy === 'drop') { decide(false, 'quiet_hours_drop'); continue; }\n      const sendAt = nextOpenWindow(nowDate, config.quietHours, config.business?.timezone);\n      // Deferring past the appointment itself is pointless — drop instead.\n      if (hoursBetween(sendAt, appointment.startAt) <= minLead) { decide(false, 'quiet_hours_would_expire'); continue; }\n      decide(true, 'quiet_hours_deferred', sendAt);\n      continue;\n    }\n    decide(true, 'due');\n  }\n  return decisions;\n}\n\n/**\n * Should this unconfirmed appointment get a voice call?\n * Gated on ticket value so the engine never spends more on the call than the\n * slot is worth.\n */\nfunction shouldEscalateToVoice(appointment, config, now) {\n  const esc = config.escalation || {};\n  if (!esc.voiceEnabled || config.channels?.voice?.enabled === false) {\n    return { escalate: false, reason: 'voice_disabled' };\n  }\n  const status = appointment.status || STATES.SCHEDULED;\n  if (status === STATES.CONFIRMED) return { escalate: false, reason: 'already_confirmed' };\n  if (TERMINAL_STATES.includes(status)) return { escalate: false, reason: `terminal_state:${status}` };\n  if (appointment.optedOut) return { escalate: false, reason: 'opted_out' };\n  if ((appointment.voiceAttempts || 0) >= (esc.maxVoiceAttempts ?? 1)) {\n    return { escalate: false, reason: 'max_attempts_reached' };\n  }\n  const value = Number(appointment.value ?? config.business?.avgAppointmentValue ?? 0);\n  if (value < (esc.minValueForVoiceCall ?? 0)) return { escalate: false, reason: 'below_value_threshold' };\n\n  const hoursOut = hoursBetween(now, appointment.startAt);\n  if (hoursOut <= 0) return { escalate: false, reason: 'in_the_past' };\n  if (hoursOut > (esc.voiceCallIfUnconfirmedHours ?? 6)) return { escalate: false, reason: 'not_yet_due' };\n  if (inQuietHours(now, config.quietHours, config.business?.timezone)) {\n    return { escalate: false, reason: 'quiet_hours' };\n  }\n  return { escalate: true, reason: 'unconfirmed_and_valuable' };\n}\n\n/* ------------------------------------------------------------------ *\n * Channel selection\n * ------------------------------------------------------------------ */\n\n/**\n * Pick the next channel to try.\n *\n * Order comes from the stage, falling back to the global ladder. A channel is\n * skipped when it is disabled, already failed this attempt, or the contact has\n * no address for it. WhatsApp additionally needs either an open 24h session or\n * an approved template — sending outside that window is a policy violation, not\n * just a failed send.\n */\nfunction pickChannel(candidates, contact, config, opts) {\n  const options = opts || {};\n  const failed = new Set(options.failedChannels || []);\n  const order = (candidates && candidates.length ? candidates : config.channels?.priority) || [];\n  const attempts = [];\n\n  for (const channel of order) {\n    const conf = config.channels?.[channel];\n    if (!conf || conf.enabled === false) { attempts.push({ channel, ok: false, reason: 'channel_disabled' }); continue; }\n    if (failed.has(channel)) { attempts.push({ channel, ok: false, reason: 'already_failed' }); continue; }\n\n    const address = addressFor(channel, contact);\n    if (!address) { attempts.push({ channel, ok: false, reason: 'no_address' }); continue; }\n    if (contact.consent && contact.consent[channel] === false) {\n      attempts.push({ channel, ok: false, reason: 'no_consent_for_channel' });\n      continue;\n    }\n    if (channel === 'whatsapp') {\n      const open = whatsappSessionOpen(contact.lastInboundAt, options.now || new Date(), config);\n      if (!open && !options.templateApproved) {\n        attempts.push({ channel, ok: false, reason: 'whatsapp_session_closed_no_template' });\n        continue;\n      }\n      return { channel, address, mode: open ? 'freeform' : 'template', attempts };\n    }\n    return { channel, address, mode: 'direct', attempts };\n  }\n  return { channel: null, address: null, mode: null, attempts, reason: 'no_channel_available' };\n}\n\nfunction addressFor(channel, contact) {\n  if (!contact) return null;\n  if (channel === 'email') return contact.email || null;\n  if (channel === 'whatsapp') return contact.whatsapp || contact.phone || null;\n  return contact.phone || null; // sms, voice\n}\n\n/** WhatsApp free-form messaging is only allowed inside the 24h customer window. */\nfunction whatsappSessionOpen(lastInboundAt, now, config) {\n  if (!lastInboundAt) return false;\n  const windowHours = config.compliance?.whatsappSessionWindowHours ?? 24;\n  const elapsed = hoursBetween(lastInboundAt, now);\n  return elapsed >= 0 && elapsed < windowHours;\n}\n\n/* ------------------------------------------------------------------ *\n * Consent gate — checked before every outbound message\n * ------------------------------------------------------------------ */\n\n/**\n * The single chokepoint every send passes through.\n *\n * Transactional messages about an appointment the customer actually booked are\n * allowed without marketing consent; anything promotional (recall, reviews) is\n * not. `requireExplicitConsent` tightens even the transactional path.\n */\nfunction consentGate(contact, config, kind) {\n  const c = config.compliance || {};\n  if (!contact) return { allowed: false, reason: 'no_contact' };\n  if (contact.optedOut) return { allowed: false, reason: 'opted_out' };\n\n  const promotional = kind === 'marketing' || kind === 'recall' || kind === 'review';\n  if (promotional && contact.marketingConsent !== true) {\n    return { allowed: false, reason: 'no_marketing_consent' };\n  }\n  if (c.requireExplicitConsent && contact.consentAt == null && !promotional) {\n    return { allowed: false, reason: 'no_recorded_consent' };\n  }\n  return { allowed: true, reason: promotional ? 'marketing_consent_present' : 'transactional' };\n}\n\n/* ------------------------------------------------------------------ *\n * Templating\n * ------------------------------------------------------------------ */\n\n/**\n * Render {{placeholders}}. Unknown keys resolve to '' rather than leaking a raw\n * \"{{firstName}}\" into a customer's inbox.\n */\nfunction renderTemplate(template, vars) {\n  return String(template ?? '').replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (_, path) => {\n    const value = path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), vars);\n    return value == null ? '' : String(value);\n  });\n}\n\n/** Append the opt-out footer once, and only where policy needs it. */\nfunction withOptOutFooter(body, config, channel) {\n  const c = config.compliance || {};\n  if (!c.includeOptOutFooter) return body;\n  if (channel === 'email' || channel === 'voice') return body;\n  const footer = (config.templates?.optOutFooter || ' Reply STOP to opt out.').trim();\n  return body.toUpperCase().includes('STOP') ? body : `${body.trim()} ${footer}`;\n}\n\n/* ------------------------------------------------------------------ *\n * Inbound intent classification\n * ------------------------------------------------------------------ */\n\n/**\n * Classify an inbound reply without an LLM.\n *\n * Compliance keywords are matched first and are absolute: \"STOP\" must opt the\n * customer out even if the rest of the message is chatty. Everything else is\n * word-boundary matched so \"notebook\" is never read as \"no\".\n *\n * Returns confidence so the caller can route low-confidence text to AI or a human.\n */\nfunction classifyIntent(text, config) {\n  const raw = String(text ?? '').trim();\n  if (!raw) return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n  const upper = raw.toUpperCase();\n  const c = config.compliance || {};\n\n  const keywordHit = (list) =>\n    (list || []).find((k) => new RegExp(`\\\\b${escapeRegex(String(k).toUpperCase())}\\\\b`).test(upper));\n\n  const stop = keywordHit(c.stopKeywords);\n  if (stop) return { intent: INTENTS.STOP, confidence: 1, matched: stop };\n  const start = keywordHit(c.startKeywords);\n  if (start) return { intent: INTENTS.START, confidence: 1, matched: start };\n  const help = keywordHit(c.helpKeywords);\n  if (help) return { intent: INTENTS.HELP, confidence: 1, matched: help };\n\n  // A bare 1-5 is a rating reply to the post-visit survey.\n  const rating = /^([1-5])(\\s*\\/\\s*5)?$/.exec(raw);\n  if (rating) return { intent: INTENTS.RATING, confidence: 1, rating: Number(rating[1]), matched: rating[0] };\n\n  const patterns = [\n    [INTENTS.RESCHEDULE, /\\b(reschedul\\w*|change|move|shift|postpone|another time|different time|new time)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(cancel|can'?t make it|cannot make it|not coming|won'?t be able|unable to come)\\b/i, 0.95],\n    [INTENTS.CONFIRM, /\\b(yes|y|yep|yeah|yup|confirm\\w*|ok|okay|sure|coming|i'?ll be there|see you)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(no|n|nope|nah)\\b/i, 0.75],\n  ];\n  for (const [intent, re, confidence] of patterns) {\n    const m = re.exec(raw);\n    // A long message that merely contains \"yes\" is not a reliable confirmation.\n    if (m) return { intent, confidence: raw.length > 60 ? confidence - 0.25 : confidence, matched: m[0] };\n  }\n  return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n}\n\nfunction escapeRegex(s) {\n  return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n\n/* ------------------------------------------------------------------ *\n * State machine\n * ------------------------------------------------------------------ */\n\nconst TRANSITIONS = Object.freeze({\n  [STATES.SCHEDULED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.REMINDED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CONFIRMED]: {\n    reminder_sent: STATES.CONFIRMED, // a later reminder must not undo a confirmation\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CANCELLED]: { reply_confirm: STATES.CONFIRMED }, // customer changed their mind\n  [STATES.RESCHEDULED]: {},\n  [STATES.COMPLETED]: {},\n  [STATES.NO_SHOW]: {},\n});\n\n/**\n * Apply an event to an appointment state.\n * Invalid transitions are refused, not thrown — a stray inbound \"yes\" on a\n * completed appointment should be ignored, not page anyone.\n */\nfunction nextState(current, event) {\n  const from = current || STATES.SCHEDULED;\n  const to = TRANSITIONS[from]?.[event];\n  if (!to) return { state: from, changed: false, reason: `invalid_transition:${from}->${event}` };\n  return { state: to, changed: to !== from, reason: `${from}->${to}` };\n}\n\nconst INTENT_TO_EVENT = Object.freeze({\n  [INTENTS.CONFIRM]: 'reply_confirm',\n  [INTENTS.CANCEL]: 'reply_cancel',\n  [INTENTS.RESCHEDULE]: 'reply_reschedule',\n});\n\n/* ------------------------------------------------------------------ *\n * Retry policy\n * ------------------------------------------------------------------ */\n\n/** Split provider failures into retry-worthy and permanent. */\nfunction classifyFailure(statusCode, errorMessage) {\n  const code = Number(statusCode) || 0;\n  const msg = String(errorMessage || '').toLowerCase();\n  if (/invalid|not a valid|unsubscrib|blacklist|opted out|landline|unreachable destination/.test(msg)) {\n    return { retryable: false, category: 'permanent_recipient' };\n  }\n  if (code === 429) return { retryable: true, category: 'rate_limited' };\n  if (code >= 500) return { retryable: true, category: 'provider_error' };\n  if (code === 408 || code === 0) return { retryable: true, category: 'network' };\n  if (code >= 400) return { retryable: false, category: 'bad_request' };\n  return { retryable: false, category: 'unknown' };\n}\n\n/** Backoff for `attempt` (1-based), clamped to the configured ladder. */\nfunction retryDelaySeconds(attempt, config) {\n  const ladder = config.reliability?.retryBackoffSeconds || [30, 300, 1800];\n  return ladder[Math.min(Math.max(attempt, 1) - 1, ladder.length - 1)];\n}\n\n/* ------------------------------------------------------------------ *\n * ROI — the number that keeps this switched on\n * ------------------------------------------------------------------ */\n\n/**\n * Turn the message log into currency.\n *\n * `protectedRevenue` counts only appointments that were unconfirmed, then\n * confirmed after a deskbell reminder — the ones plausibly saved. It deliberately\n * does not claim credit for everything that happened to show up.\n */\nfunction computeRoi(events, config, options) {\n  const opts = options || {};\n  const avg = Number(config.business?.avgAppointmentValue || 0);\n  const noShowRate = Number(opts.baselineNoShowRate ?? 0.2);\n\n  let remindersSent = 0, confirmations = 0, cancellationsRecovered = 0;\n  let missedCallsRecovered = 0, messageCost = 0, slotsRefilled = 0;\n\n  for (const e of events || []) {\n    if (e.type === 'reminder_sent') {\n      remindersSent++;\n      messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n    } else if (e.type === 'confirmed_after_reminder') confirmations++;\n    else if (e.type === 'cancelled_early') cancellationsRecovered++;\n    else if (e.type === 'waitlist_filled') slotsRefilled++;\n    else if (e.type === 'missed_call_recovered') missedCallsRecovered++;\n    else if (e.type === 'message_sent') messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n  }\n\n  // Each confirmation removes roughly one baseline no-show's worth of risk.\n  const protectedRevenue = confirmations * avg * noShowRate;\n  const refilledRevenue = slotsRefilled * avg;\n  const recoveredCallRevenue = missedCallsRecovered * avg;\n  const grossValue = protectedRevenue + refilledRevenue + recoveredCallRevenue;\n\n  return {\n    currency: config.business?.currency || 'USD',\n    remindersSent,\n    confirmations,\n    confirmationRate: remindersSent ? round2(confirmations / remindersSent) : 0,\n    cancellationsRecovered,\n    slotsRefilled,\n    missedCallsRecovered,\n    messageCost: round2(messageCost),\n    protectedRevenue: round2(protectedRevenue),\n    refilledRevenue: round2(refilledRevenue),\n    recoveredCallRevenue: round2(recoveredCallRevenue),\n    netValue: round2(grossValue - messageCost),\n    roiMultiple: messageCost > 0 ? round2(grossValue / messageCost) : null,\n  };\n}\n\nfunction round2(n) {\n  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;\n}\n\n/* ------------------------------------------------------------------ *\n * Normalization\n * ------------------------------------------------------------------ */\n\n/** Coerce an appointment row from any source into the engine's shape. */\nfunction normalizeAppointment(row) {\n  const r = row || {};\n  const startAt = r.startAt || r.start_at || r.start || r.startTime;\n  return {\n    id: String(r.id || r.appointmentId || r.appointment_id || r.uid || ''),\n    externalId: r.externalId || r.external_id || null,\n    startAt: startAt ? new Date(startAt).toISOString() : null,\n    endAt: r.endAt || r.end_at ? new Date(r.endAt || r.end_at).toISOString() : null,\n    status: r.status || STATES.SCHEDULED,\n    confirmedAt: r.confirmedAt || r.confirmed_at || null,\n    serviceName: r.serviceName || r.service_name || r.service || r.summary || 'appointment',\n    value: r.value != null ? Number(r.value) : null,\n    voiceAttempts: Number(r.voiceAttempts || r.voice_attempts || 0),\n    sentStages: parseList(r.sentStages ?? r.sent_stages),\n    optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    contact: {\n      id: String(r.contactId || r.contact_id || r.phone || ''),\n      firstName: r.firstName || r.first_name || (r.name ? String(r.name).split(' ')[0] : '') || '',\n      name: r.name || r.customerName || r.customer_name || '',\n      phone: normalizePhone(r.phone || r.contactPhone || r.contact_phone),\n      whatsapp: normalizePhone(r.whatsapp || r.phone || r.contactPhone),\n      email: r.email || r.contactEmail || r.contact_email || null,\n      petName: r.petName || r.pet_name || null,\n      lastInboundAt: r.lastInboundAt || r.last_inbound_at || null,\n      consentAt: r.consentAt || r.consent_at || null,\n      marketingConsent: r.marketingConsent === true || r.marketing_consent === true ||\n        String(r.marketing_consent).toLowerCase() === 'true',\n      optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    },\n  };\n}\n\nfunction parseList(v) {\n  if (Array.isArray(v)) return v.map(String);\n  if (v == null || v === '') return [];\n  return String(v).split(',').map((s) => s.trim()).filter(Boolean);\n}\n\n/** E.164-ish normalization. Keeps a leading +, strips everything else. */\nfunction normalizePhone(value) {\n  if (!value) return null;\n  const s = String(value).trim();\n  const plus = s.startsWith('+');\n  const digits = s.replace(/\\D/g, '');\n  if (!digits) return null;\n  return plus ? `+${digits}` : digits;\n}\n\n/** Fill in every key the engine reads so no node has to guard for undefined. */\nfunction normalizeConfig(raw) {\n  const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n  cfg.business = cfg.business || {};\n  cfg.business.timezone = cfg.business.timezone || 'UTC';\n  cfg.business.currency = cfg.business.currency || 'USD';\n  cfg.business.minLeadTimeHours = cfg.business.minLeadTimeHours ?? 1;\n  cfg.channels = cfg.channels || {};\n  cfg.channels.priority = cfg.channels.priority || ['sms'];\n  cfg.reminders = Array.isArray(cfg.reminders) ? cfg.reminders : [];\n  cfg.quietHours = cfg.quietHours || { enabled: false };\n  cfg.escalation = cfg.escalation || {};\n  cfg.compliance = cfg.compliance || {};\n  cfg.compliance.stopKeywords = cfg.compliance.stopKeywords || ['STOP'];\n  cfg.compliance.startKeywords = cfg.compliance.startKeywords || ['START'];\n  cfg.compliance.helpKeywords = cfg.compliance.helpKeywords || ['HELP'];\n  cfg.reliability = cfg.reliability || {};\n  cfg.templates = cfg.templates || {};\n  return cfg;\n}\n\n/* ------------------------------------------------------------------ *\n * Exports — Node for tests, globals when inlined into an n8n Code node\n * ------------------------------------------------------------------ */\n\nconst DESKBELL = {\n  STATES, TERMINAL_STATES, INTENTS, TRANSITIONS, INTENT_TO_EVENT,\n  parseHHMM, zonedParts, hoursBetween, inQuietHours, nextOpenWindow,\n  idempotencyKey, evaluateReminders, shouldEscalateToVoice,\n  pickChannel, addressFor, whatsappSessionOpen, consentGate,\n  renderTemplate, withOptOutFooter, classifyIntent, nextState,\n  classifyFailure, retryDelaySeconds, computeRoi,\n  normalizeAppointment, normalizeConfig, normalizePhone,\n};\n\nif (typeof module !== 'undefined' && module.exports) module.exports = DESKBELL;\n// ---------------------------------------------------------------- node logic\n\n\n// Reached either by a stopped ladder (success or permanent failure) or by the\n// loop running out of channels. Report the best attempt either way.\nconst attempts = $('Evaluate Attempt').all().map(i => i.json);\nconst success = attempts.find(a => a.sent);\nconst last = attempts[attempts.length - 1] || {};\n\nreturn [{\n  json: {\n    sent: Boolean(success),\n    channel: (success || last).channel || null,\n    providerMessageId: (success || last).providerMessageId || null,\n    body: (success || last).body || null,\n    cost: success ? (success.cost || 0) : 0,\n    attempts: attempts.length,\n    channelsTried: attempts.map(a => a.channel),\n    error: success ? null : (last.error || 'all_channels_failed'),\n    failureCategory: success ? null : (last.failureCategory || null),\n    idempotencyKey: (success || last).idempotencyKey || null,\n  },\n}];"
+      },
+      "id": "fa8c569e-e8be-47ba-a7e7-86f1b64be6c9",
+      "name": "Return Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// deskbell/03 — blocked before any provider was contacted\n// Engine functions below are inlined from lib/core.js by scripts/build-workflows.mjs.\n// Do not edit them here — edit lib/core.js and run `npm run build`.\n/* ------------------------------------------------------------------ *\n * Constants\n * ------------------------------------------------------------------ */\n\nconst STATES = Object.freeze({\n  SCHEDULED: 'scheduled',\n  REMINDED: 'reminded',\n  CONFIRMED: 'confirmed',\n  CANCELLED: 'cancelled',\n  RESCHEDULED: 'rescheduled',\n  COMPLETED: 'completed',\n  NO_SHOW: 'no_show',\n});\n\n/** States from which no further reminder is ever sent. */\nconst TERMINAL_STATES = Object.freeze([\n  STATES.CANCELLED,\n  STATES.RESCHEDULED,\n  STATES.COMPLETED,\n  STATES.NO_SHOW,\n]);\n\nconst INTENTS = Object.freeze({\n  CONFIRM: 'confirm',\n  CANCEL: 'cancel',\n  RESCHEDULE: 'reschedule',\n  STOP: 'stop',\n  START: 'start',\n  HELP: 'help',\n  RATING: 'rating',\n  UNKNOWN: 'unknown',\n});\n\n/* ------------------------------------------------------------------ *\n * Time helpers (timezone-correct, DST-safe via Intl)\n * ------------------------------------------------------------------ */\n\n/** \"21:30\" -> 1290 minutes since local midnight. */\nfunction parseHHMM(value) {\n  const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(value || '').trim());\n  if (!m) return null;\n  const h = Number(m[1]);\n  const min = Number(m[2]);\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\n\n/**\n * Wall-clock parts of `date` in `timeZone`.\n * Intl is used rather than manual offset maths so DST transitions are correct.\n */\nfunction zonedParts(date, timeZone) {\n  const d = date instanceof Date ? date : new Date(date);\n  if (Number.isNaN(d.getTime())) throw new TypeError('zonedParts: invalid date');\n  const fmt = new Intl.DateTimeFormat('en-CA', {\n    timeZone: timeZone || 'UTC',\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false, weekday: 'short',\n  });\n  const parts = {};\n  for (const p of fmt.formatToParts(d)) parts[p.type] = p.value;\n  // en-CA renders midnight as \"24\" in some runtimes; normalize to 0.\n  const hour = Number(parts.hour) % 24;\n  return {\n    year: Number(parts.year),\n    month: Number(parts.month),\n    day: Number(parts.day),\n    hour,\n    minute: Number(parts.minute),\n    second: Number(parts.second),\n    weekday: parts.weekday,\n    minutesOfDay: hour * 60 + Number(parts.minute),\n    isoDate: `${parts.year}-${parts.month}-${parts.day}`,\n  };\n}\n\n/** Hours from `from` to `to`. Negative when `to` is in the past. */\nfunction hoursBetween(from, to) {\n  return (new Date(to).getTime() - new Date(from).getTime()) / 3_600_000;\n}\n\n/**\n * Is `date` inside the configured quiet window in the business timezone?\n * Handles windows that wrap midnight (21:00 -> 08:00), which is the normal case.\n */\nfunction inQuietHours(date, quietHours, timeZone) {\n  if (!quietHours || quietHours.enabled === false) return false;\n  const start = parseHHMM(quietHours.start);\n  const end = parseHHMM(quietHours.end);\n  if (start === null || end === null || start === end) return false;\n  const nowMin = zonedParts(date, timeZone).minutesOfDay;\n  return start > end\n    ? nowMin >= start || nowMin < end // wraps midnight\n    : nowMin >= start && nowMin < end; // same-day window\n}\n\n/**\n * The first instant at or after `date` whose local wall clock equals the end of\n * quiet hours.\n *\n * A naive \"add N minutes of UTC\" lands an hour off across a DST boundary — on a\n * spring-forward night the local day is only 23 hours long, so the jump\n * overshoots to 09:00. Instead we make a first guess and then converge on the\n * target wall-clock time, which is correct under both DST directions.\n */\nfunction nextOpenWindow(date, quietHours, timeZone) {\n  const d = new Date(date);\n  if (!inQuietHours(d, quietHours, timeZone)) return d;\n  const end = parseHHMM(quietHours.end);\n\n  let deltaMin = end - zonedParts(d, timeZone).minutesOfDay;\n  if (deltaMin <= 0) deltaMin += 1440;\n  let candidate = new Date(d.getTime() + deltaMin * 60_000);\n\n  // Converge on local `end`. Two passes suffice for any real offset; the third\n  // is insurance against a half-hour-offset zone landing on a DST edge.\n  for (let i = 0; i < 3; i++) {\n    let diff = end - zonedParts(candidate, timeZone).minutesOfDay;\n    if (diff === 0) break;\n    // Take the shorter way round so we correct by minutes, not by a whole day.\n    if (diff > 720) diff -= 1440;\n    if (diff < -720) diff += 1440;\n    candidate = new Date(candidate.getTime() + diff * 60_000);\n  }\n  // Correcting backwards must never produce a send in the past.\n  if (candidate <= d) candidate = new Date(candidate.getTime() + 1440 * 60_000);\n  return candidate;\n}\n\n/* ------------------------------------------------------------------ *\n * Idempotency\n * ------------------------------------------------------------------ */\n\n/**\n * Deterministic, human-readable send key.\n *\n * Deliberately not a hash: when a customer complains about a duplicate text you\n * want to read the key in the log and know exactly which appointment and stage\n * produced it. Uniqueness is what matters, not opacity.\n */\nfunction idempotencyKey(appointmentId, stage, discriminator) {\n  const safe = (v) => String(v ?? '').trim().replace(/[|\\s]+/g, '_');\n  const base = `${safe(appointmentId)}|${safe(stage)}`;\n  return discriminator ? `${base}|${safe(discriminator)}` : base;\n}\n\n/* ------------------------------------------------------------------ *\n * Reminder scheduling — the core decision\n * ------------------------------------------------------------------ */\n\n/**\n * Decide which reminder stages are due for one appointment right now.\n *\n * Returns one decision object per configured stage, each carrying an explicit\n * `reason`. Nothing is silently dropped — an unsent reminder always has a\n * recorded cause, which is what makes support calls answerable.\n *\n * @param {object} appointment {id, startAt, status, confirmedAt, value, sentStages[], optedOut}\n * @param {object} config      normalized deskbell config\n * @param {Date|string} now\n * @returns {Array<{stage,due,reason,sendAt,idempotencyKey,channels}>}\n */\nfunction evaluateReminders(appointment, config, now) {\n  const nowDate = new Date(now);\n  const stages = [...(config.reminders || [])].sort((a, b) => b.offsetHours - a.offsetHours);\n  const sent = new Set(appointment.sentStages || []);\n  const status = appointment.status || STATES.SCHEDULED;\n  const hoursOut = hoursBetween(nowDate, appointment.startAt);\n  const minLead = config.business?.minLeadTimeHours ?? 0;\n  const decisions = [];\n\n  for (let i = 0; i < stages.length; i++) {\n    const stage = stages[i];\n    // The floor of this stage's window is the next (tighter) stage's offset.\n    // Without it, a T-7d reminder fires at T-2h whenever a sync ran late and\n    // the customer gets a \"see you in a week\" text two hours before arriving.\n    const floor = i + 1 < stages.length ? stages[i + 1].offsetHours : minLead;\n    const key = idempotencyKey(appointment.id, stage.stage);\n    const decide = (due, reason, sendAt) =>\n      decisions.push({\n        stage: stage.stage,\n        due,\n        reason,\n        sendAt: (sendAt || nowDate).toISOString(),\n        idempotencyKey: key,\n        channels: stage.channels || config.channels?.priority || [],\n        requiresConfirmation: !!stage.requiresConfirmation,\n      });\n\n    if (sent.has(stage.stage)) { decide(false, 'already_sent'); continue; }\n    if (appointment.optedOut) { decide(false, 'opted_out'); continue; }\n    if (TERMINAL_STATES.includes(status)) { decide(false, `terminal_state:${status}`); continue; }\n    if (hoursOut <= minLead) { decide(false, 'too_late'); continue; }\n    if (hoursOut > stage.offsetHours) { decide(false, 'not_yet_due'); continue; }\n    if (hoursOut < floor) { decide(false, 'window_missed'); continue; }\n    if (stage.onlyIfUnconfirmed && status === STATES.CONFIRMED) { decide(false, 'already_confirmed'); continue; }\n\n    if (inQuietHours(nowDate, config.quietHours, config.business?.timezone)) {\n      if (config.quietHours?.strategy === 'drop') { decide(false, 'quiet_hours_drop'); continue; }\n      const sendAt = nextOpenWindow(nowDate, config.quietHours, config.business?.timezone);\n      // Deferring past the appointment itself is pointless — drop instead.\n      if (hoursBetween(sendAt, appointment.startAt) <= minLead) { decide(false, 'quiet_hours_would_expire'); continue; }\n      decide(true, 'quiet_hours_deferred', sendAt);\n      continue;\n    }\n    decide(true, 'due');\n  }\n  return decisions;\n}\n\n/**\n * Should this unconfirmed appointment get a voice call?\n * Gated on ticket value so the engine never spends more on the call than the\n * slot is worth.\n */\nfunction shouldEscalateToVoice(appointment, config, now) {\n  const esc = config.escalation || {};\n  if (!esc.voiceEnabled || config.channels?.voice?.enabled === false) {\n    return { escalate: false, reason: 'voice_disabled' };\n  }\n  const status = appointment.status || STATES.SCHEDULED;\n  if (status === STATES.CONFIRMED) return { escalate: false, reason: 'already_confirmed' };\n  if (TERMINAL_STATES.includes(status)) return { escalate: false, reason: `terminal_state:${status}` };\n  if (appointment.optedOut) return { escalate: false, reason: 'opted_out' };\n  if ((appointment.voiceAttempts || 0) >= (esc.maxVoiceAttempts ?? 1)) {\n    return { escalate: false, reason: 'max_attempts_reached' };\n  }\n  const value = Number(appointment.value ?? config.business?.avgAppointmentValue ?? 0);\n  if (value < (esc.minValueForVoiceCall ?? 0)) return { escalate: false, reason: 'below_value_threshold' };\n\n  const hoursOut = hoursBetween(now, appointment.startAt);\n  if (hoursOut <= 0) return { escalate: false, reason: 'in_the_past' };\n  if (hoursOut > (esc.voiceCallIfUnconfirmedHours ?? 6)) return { escalate: false, reason: 'not_yet_due' };\n  if (inQuietHours(now, config.quietHours, config.business?.timezone)) {\n    return { escalate: false, reason: 'quiet_hours' };\n  }\n  return { escalate: true, reason: 'unconfirmed_and_valuable' };\n}\n\n/* ------------------------------------------------------------------ *\n * Channel selection\n * ------------------------------------------------------------------ */\n\n/**\n * Pick the next channel to try.\n *\n * Order comes from the stage, falling back to the global ladder. A channel is\n * skipped when it is disabled, already failed this attempt, or the contact has\n * no address for it. WhatsApp additionally needs either an open 24h session or\n * an approved template — sending outside that window is a policy violation, not\n * just a failed send.\n */\nfunction pickChannel(candidates, contact, config, opts) {\n  const options = opts || {};\n  const failed = new Set(options.failedChannels || []);\n  const order = (candidates && candidates.length ? candidates : config.channels?.priority) || [];\n  const attempts = [];\n\n  for (const channel of order) {\n    const conf = config.channels?.[channel];\n    if (!conf || conf.enabled === false) { attempts.push({ channel, ok: false, reason: 'channel_disabled' }); continue; }\n    if (failed.has(channel)) { attempts.push({ channel, ok: false, reason: 'already_failed' }); continue; }\n\n    const address = addressFor(channel, contact);\n    if (!address) { attempts.push({ channel, ok: false, reason: 'no_address' }); continue; }\n    if (contact.consent && contact.consent[channel] === false) {\n      attempts.push({ channel, ok: false, reason: 'no_consent_for_channel' });\n      continue;\n    }\n    if (channel === 'whatsapp') {\n      const open = whatsappSessionOpen(contact.lastInboundAt, options.now || new Date(), config);\n      if (!open && !options.templateApproved) {\n        attempts.push({ channel, ok: false, reason: 'whatsapp_session_closed_no_template' });\n        continue;\n      }\n      return { channel, address, mode: open ? 'freeform' : 'template', attempts };\n    }\n    return { channel, address, mode: 'direct', attempts };\n  }\n  return { channel: null, address: null, mode: null, attempts, reason: 'no_channel_available' };\n}\n\nfunction addressFor(channel, contact) {\n  if (!contact) return null;\n  if (channel === 'email') return contact.email || null;\n  if (channel === 'whatsapp') return contact.whatsapp || contact.phone || null;\n  return contact.phone || null; // sms, voice\n}\n\n/** WhatsApp free-form messaging is only allowed inside the 24h customer window. */\nfunction whatsappSessionOpen(lastInboundAt, now, config) {\n  if (!lastInboundAt) return false;\n  const windowHours = config.compliance?.whatsappSessionWindowHours ?? 24;\n  const elapsed = hoursBetween(lastInboundAt, now);\n  return elapsed >= 0 && elapsed < windowHours;\n}\n\n/* ------------------------------------------------------------------ *\n * Consent gate — checked before every outbound message\n * ------------------------------------------------------------------ */\n\n/**\n * The single chokepoint every send passes through.\n *\n * Transactional messages about an appointment the customer actually booked are\n * allowed without marketing consent; anything promotional (recall, reviews) is\n * not. `requireExplicitConsent` tightens even the transactional path.\n */\nfunction consentGate(contact, config, kind) {\n  const c = config.compliance || {};\n  if (!contact) return { allowed: false, reason: 'no_contact' };\n  if (contact.optedOut) return { allowed: false, reason: 'opted_out' };\n\n  const promotional = kind === 'marketing' || kind === 'recall' || kind === 'review';\n  if (promotional && contact.marketingConsent !== true) {\n    return { allowed: false, reason: 'no_marketing_consent' };\n  }\n  if (c.requireExplicitConsent && contact.consentAt == null && !promotional) {\n    return { allowed: false, reason: 'no_recorded_consent' };\n  }\n  return { allowed: true, reason: promotional ? 'marketing_consent_present' : 'transactional' };\n}\n\n/* ------------------------------------------------------------------ *\n * Templating\n * ------------------------------------------------------------------ */\n\n/**\n * Render {{placeholders}}. Unknown keys resolve to '' rather than leaking a raw\n * \"{{firstName}}\" into a customer's inbox.\n */\nfunction renderTemplate(template, vars) {\n  return String(template ?? '').replace(/\\{\\{\\s*([\\w.]+)\\s*\\}\\}/g, (_, path) => {\n    const value = path.split('.').reduce((acc, k) => (acc == null ? undefined : acc[k]), vars);\n    return value == null ? '' : String(value);\n  });\n}\n\n/** Append the opt-out footer once, and only where policy needs it. */\nfunction withOptOutFooter(body, config, channel) {\n  const c = config.compliance || {};\n  if (!c.includeOptOutFooter) return body;\n  if (channel === 'email' || channel === 'voice') return body;\n  const footer = (config.templates?.optOutFooter || ' Reply STOP to opt out.').trim();\n  return body.toUpperCase().includes('STOP') ? body : `${body.trim()} ${footer}`;\n}\n\n/* ------------------------------------------------------------------ *\n * Inbound intent classification\n * ------------------------------------------------------------------ */\n\n/**\n * Classify an inbound reply without an LLM.\n *\n * Compliance keywords are matched first and are absolute: \"STOP\" must opt the\n * customer out even if the rest of the message is chatty. Everything else is\n * word-boundary matched so \"notebook\" is never read as \"no\".\n *\n * Returns confidence so the caller can route low-confidence text to AI or a human.\n */\nfunction classifyIntent(text, config) {\n  const raw = String(text ?? '').trim();\n  if (!raw) return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n  const upper = raw.toUpperCase();\n  const c = config.compliance || {};\n\n  const keywordHit = (list) =>\n    (list || []).find((k) => new RegExp(`\\\\b${escapeRegex(String(k).toUpperCase())}\\\\b`).test(upper));\n\n  const stop = keywordHit(c.stopKeywords);\n  if (stop) return { intent: INTENTS.STOP, confidence: 1, matched: stop };\n  const start = keywordHit(c.startKeywords);\n  if (start) return { intent: INTENTS.START, confidence: 1, matched: start };\n  const help = keywordHit(c.helpKeywords);\n  if (help) return { intent: INTENTS.HELP, confidence: 1, matched: help };\n\n  // A bare 1-5 is a rating reply to the post-visit survey.\n  const rating = /^([1-5])(\\s*\\/\\s*5)?$/.exec(raw);\n  if (rating) return { intent: INTENTS.RATING, confidence: 1, rating: Number(rating[1]), matched: rating[0] };\n\n  const patterns = [\n    [INTENTS.RESCHEDULE, /\\b(reschedul\\w*|change|move|shift|postpone|another time|different time|new time)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(cancel|can'?t make it|cannot make it|not coming|won'?t be able|unable to come)\\b/i, 0.95],\n    [INTENTS.CONFIRM, /\\b(yes|y|yep|yeah|yup|confirm\\w*|ok|okay|sure|coming|i'?ll be there|see you)\\b/i, 0.9],\n    [INTENTS.CANCEL, /\\b(no|n|nope|nah)\\b/i, 0.75],\n  ];\n  for (const [intent, re, confidence] of patterns) {\n    const m = re.exec(raw);\n    // A long message that merely contains \"yes\" is not a reliable confirmation.\n    if (m) return { intent, confidence: raw.length > 60 ? confidence - 0.25 : confidence, matched: m[0] };\n  }\n  return { intent: INTENTS.UNKNOWN, confidence: 0, matched: null };\n}\n\nfunction escapeRegex(s) {\n  return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n\n/* ------------------------------------------------------------------ *\n * State machine\n * ------------------------------------------------------------------ */\n\nconst TRANSITIONS = Object.freeze({\n  [STATES.SCHEDULED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.REMINDED]: {\n    reminder_sent: STATES.REMINDED,\n    reply_confirm: STATES.CONFIRMED,\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CONFIRMED]: {\n    reminder_sent: STATES.CONFIRMED, // a later reminder must not undo a confirmation\n    reply_cancel: STATES.CANCELLED,\n    reply_reschedule: STATES.RESCHEDULED,\n    marked_attended: STATES.COMPLETED,\n    marked_no_show: STATES.NO_SHOW,\n  },\n  [STATES.CANCELLED]: { reply_confirm: STATES.CONFIRMED }, // customer changed their mind\n  [STATES.RESCHEDULED]: {},\n  [STATES.COMPLETED]: {},\n  [STATES.NO_SHOW]: {},\n});\n\n/**\n * Apply an event to an appointment state.\n * Invalid transitions are refused, not thrown — a stray inbound \"yes\" on a\n * completed appointment should be ignored, not page anyone.\n */\nfunction nextState(current, event) {\n  const from = current || STATES.SCHEDULED;\n  const to = TRANSITIONS[from]?.[event];\n  if (!to) return { state: from, changed: false, reason: `invalid_transition:${from}->${event}` };\n  return { state: to, changed: to !== from, reason: `${from}->${to}` };\n}\n\nconst INTENT_TO_EVENT = Object.freeze({\n  [INTENTS.CONFIRM]: 'reply_confirm',\n  [INTENTS.CANCEL]: 'reply_cancel',\n  [INTENTS.RESCHEDULE]: 'reply_reschedule',\n});\n\n/* ------------------------------------------------------------------ *\n * Retry policy\n * ------------------------------------------------------------------ */\n\n/** Split provider failures into retry-worthy and permanent. */\nfunction classifyFailure(statusCode, errorMessage) {\n  const code = Number(statusCode) || 0;\n  const msg = String(errorMessage || '').toLowerCase();\n  if (/invalid|not a valid|unsubscrib|blacklist|opted out|landline|unreachable destination/.test(msg)) {\n    return { retryable: false, category: 'permanent_recipient' };\n  }\n  if (code === 429) return { retryable: true, category: 'rate_limited' };\n  if (code >= 500) return { retryable: true, category: 'provider_error' };\n  if (code === 408 || code === 0) return { retryable: true, category: 'network' };\n  if (code >= 400) return { retryable: false, category: 'bad_request' };\n  return { retryable: false, category: 'unknown' };\n}\n\n/** Backoff for `attempt` (1-based), clamped to the configured ladder. */\nfunction retryDelaySeconds(attempt, config) {\n  const ladder = config.reliability?.retryBackoffSeconds || [30, 300, 1800];\n  return ladder[Math.min(Math.max(attempt, 1) - 1, ladder.length - 1)];\n}\n\n/* ------------------------------------------------------------------ *\n * ROI — the number that keeps this switched on\n * ------------------------------------------------------------------ */\n\n/**\n * Turn the message log into currency.\n *\n * `protectedRevenue` counts only appointments that were unconfirmed, then\n * confirmed after a deskbell reminder — the ones plausibly saved. It deliberately\n * does not claim credit for everything that happened to show up.\n */\nfunction computeRoi(events, config, options) {\n  const opts = options || {};\n  const avg = Number(config.business?.avgAppointmentValue || 0);\n  const noShowRate = Number(opts.baselineNoShowRate ?? 0.2);\n\n  let remindersSent = 0, confirmations = 0, cancellationsRecovered = 0;\n  let missedCallsRecovered = 0, messageCost = 0, slotsRefilled = 0;\n\n  for (const e of events || []) {\n    if (e.type === 'reminder_sent') {\n      remindersSent++;\n      messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n    } else if (e.type === 'confirmed_after_reminder') confirmations++;\n    else if (e.type === 'cancelled_early') cancellationsRecovered++;\n    else if (e.type === 'waitlist_filled') slotsRefilled++;\n    else if (e.type === 'missed_call_recovered') missedCallsRecovered++;\n    else if (e.type === 'message_sent') messageCost += Number(config.channels?.[e.channel]?.costPerMessage || 0);\n  }\n\n  // Each confirmation removes roughly one baseline no-show's worth of risk.\n  const protectedRevenue = confirmations * avg * noShowRate;\n  const refilledRevenue = slotsRefilled * avg;\n  const recoveredCallRevenue = missedCallsRecovered * avg;\n  const grossValue = protectedRevenue + refilledRevenue + recoveredCallRevenue;\n\n  return {\n    currency: config.business?.currency || 'USD',\n    remindersSent,\n    confirmations,\n    confirmationRate: remindersSent ? round2(confirmations / remindersSent) : 0,\n    cancellationsRecovered,\n    slotsRefilled,\n    missedCallsRecovered,\n    messageCost: round2(messageCost),\n    protectedRevenue: round2(protectedRevenue),\n    refilledRevenue: round2(refilledRevenue),\n    recoveredCallRevenue: round2(recoveredCallRevenue),\n    netValue: round2(grossValue - messageCost),\n    roiMultiple: messageCost > 0 ? round2(grossValue / messageCost) : null,\n  };\n}\n\nfunction round2(n) {\n  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;\n}\n\n/* ------------------------------------------------------------------ *\n * Normalization\n * ------------------------------------------------------------------ */\n\n/** Coerce an appointment row from any source into the engine's shape. */\nfunction normalizeAppointment(row) {\n  const r = row || {};\n  const startAt = r.startAt || r.start_at || r.start || r.startTime;\n  return {\n    id: String(r.id || r.appointmentId || r.appointment_id || r.uid || ''),\n    externalId: r.externalId || r.external_id || null,\n    startAt: startAt ? new Date(startAt).toISOString() : null,\n    endAt: r.endAt || r.end_at ? new Date(r.endAt || r.end_at).toISOString() : null,\n    status: r.status || STATES.SCHEDULED,\n    confirmedAt: r.confirmedAt || r.confirmed_at || null,\n    serviceName: r.serviceName || r.service_name || r.service || r.summary || 'appointment',\n    value: r.value != null ? Number(r.value) : null,\n    voiceAttempts: Number(r.voiceAttempts || r.voice_attempts || 0),\n    sentStages: parseList(r.sentStages ?? r.sent_stages),\n    optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    contact: {\n      id: String(r.contactId || r.contact_id || r.phone || ''),\n      firstName: r.firstName || r.first_name || (r.name ? String(r.name).split(' ')[0] : '') || '',\n      name: r.name || r.customerName || r.customer_name || '',\n      phone: normalizePhone(r.phone || r.contactPhone || r.contact_phone),\n      whatsapp: normalizePhone(r.whatsapp || r.phone || r.contactPhone),\n      email: r.email || r.contactEmail || r.contact_email || null,\n      petName: r.petName || r.pet_name || null,\n      lastInboundAt: r.lastInboundAt || r.last_inbound_at || null,\n      consentAt: r.consentAt || r.consent_at || null,\n      marketingConsent: r.marketingConsent === true || r.marketing_consent === true ||\n        String(r.marketing_consent).toLowerCase() === 'true',\n      optedOut: r.optedOut === true || r.opted_out === true || String(r.opted_out).toLowerCase() === 'true',\n    },\n  };\n}\n\nfunction parseList(v) {\n  if (Array.isArray(v)) return v.map(String);\n  if (v == null || v === '') return [];\n  return String(v).split(',').map((s) => s.trim()).filter(Boolean);\n}\n\n/** E.164-ish normalization. Keeps a leading +, strips everything else. */\nfunction normalizePhone(value) {\n  if (!value) return null;\n  const s = String(value).trim();\n  const plus = s.startsWith('+');\n  const digits = s.replace(/\\D/g, '');\n  if (!digits) return null;\n  return plus ? `+${digits}` : digits;\n}\n\n/** Fill in every key the engine reads so no node has to guard for undefined. */\nfunction normalizeConfig(raw) {\n  const cfg = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n  cfg.business = cfg.business || {};\n  cfg.business.timezone = cfg.business.timezone || 'UTC';\n  cfg.business.currency = cfg.business.currency || 'USD';\n  cfg.business.minLeadTimeHours = cfg.business.minLeadTimeHours ?? 1;\n  cfg.channels = cfg.channels || {};\n  cfg.channels.priority = cfg.channels.priority || ['sms'];\n  cfg.reminders = Array.isArray(cfg.reminders) ? cfg.reminders : [];\n  cfg.quietHours = cfg.quietHours || { enabled: false };\n  cfg.escalation = cfg.escalation || {};\n  cfg.compliance = cfg.compliance || {};\n  cfg.compliance.stopKeywords = cfg.compliance.stopKeywords || ['STOP'];\n  cfg.compliance.startKeywords = cfg.compliance.startKeywords || ['START'];\n  cfg.compliance.helpKeywords = cfg.compliance.helpKeywords || ['HELP'];\n  cfg.reliability = cfg.reliability || {};\n  cfg.templates = cfg.templates || {};\n  return cfg;\n}\n\n/* ------------------------------------------------------------------ *\n * Exports — Node for tests, globals when inlined into an n8n Code node\n * ------------------------------------------------------------------ */\n\nconst DESKBELL = {\n  STATES, TERMINAL_STATES, INTENTS, TRANSITIONS, INTENT_TO_EVENT,\n  parseHHMM, zonedParts, hoursBetween, inQuietHours, nextOpenWindow,\n  idempotencyKey, evaluateReminders, shouldEscalateToVoice,\n  pickChannel, addressFor, whatsappSessionOpen, consentGate,\n  renderTemplate, withOptOutFooter, classifyIntent, nextState,\n  classifyFailure, retryDelaySeconds, computeRoi,\n  normalizeAppointment, normalizeConfig, normalizePhone,\n};\n\nif (typeof module !== 'undefined' && module.exports) module.exports = DESKBELL;\n// ---------------------------------------------------------------- node logic\n\n\nconst b = $input.first().json;\nconsole.log('deskbell/03 blocked:', b.blockedReason);\nreturn [{ json: { sent: false, blocked: true, error: b.blockedReason, channel: null,\n                  attempts: 0, cost: 0, idempotencyKey: b.idempotencyKey || null } }];"
+      },
+      "id": "a1faeb19-e77a-4bb1-af62-8825b81b96ef",
+      "name": "Return Blocked",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 03 — Message dispatcher\n\n**Every outbound message in deskbell goes through this workflow.** That is deliberate: the consent gate, the opt-out footer and the quiet-hours-aware channel choice live here, so no other workflow can accidentally route around them.\n\n### Fallback ladder\n\"Consent Gate & Plan Attempts\" builds an ordered list of viable channels. The loop tries them in order and stops at the first success — or at a permanent recipient failure, because a bad number will fail the same way on the next channel.\n\n### WhatsApp 24-hour rule\n`pickChannel()` will not send free-form WhatsApp outside the customer's 24h session window; it downgrades to template mode or falls through to SMS.",
+        "height": 420,
+        "width": 640,
+        "color": 7
+      },
+      "id": "ea6988d1-8717-4dec-835f-92f845e85dbb",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        640,
+        -180
+      ]
+    }
+  ],
+  "connections": {
+    "When Called": {
+      "main": [
+        [
+          {
+            "node": "Get Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Config": {
+      "main": [
+        [
+          {
+            "node": "Consent Gate & Plan Attempts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consent Gate & Plan Attempts": {
+      "main": [
+        [
+          {
+            "node": "Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Try Each Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Try Each Channel": {
+      "main": [
+        [
+          {
+            "node": "Return Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Channel": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send SMS (Twilio)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Place Voice Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Collect Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SMS (Twilio)": {
+      "main": [
+        [
+          {
+            "node": "Collect Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Collect Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Place Voice Call": {
+      "main": [
+        [
+          {
+            "node": "Collect Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Attempt": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Attempt": {
+      "main": [
+        [
+          {
+            "node": "Stop Ladder?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stop Ladder?": {
+      "main": [
+        [
+          {
+            "node": "Return Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Attempt Failed — Next Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attempt Failed — Next Channel": {
+      "main": [
+        [
+          {
+            "node": "Try Each Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 300,
+    "errorWorkflow": "__DESKBELL_WF_09_ERRORS__"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "deskbell"
+    }
+  ],
+  "versionId": "4910e610-7d5b-4547-b070-ba23f8336dcd",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

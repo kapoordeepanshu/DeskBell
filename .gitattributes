@@ -1,0 +1,11 @@
+# Normalise line endings in the repo so a Windows contributor and a Linux CI
+# runner produce identical diffs. Without this, `npm run verify` fails on
+# Windows purely because the regenerated workflow JSON has CRLF.
+* text=auto eol=lf
+
+# Generated — collapsed in PR diffs so reviewers look at lib/core.js instead.
+workflows/*.json   linguist-generated=true
+config/presets/*.json linguist-generated=true
+
+*.png binary
+*.jpg binary

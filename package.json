@@ -1,0 +1,38 @@
+{
+  "name": "deskbell",
+  "version": "0.1.0",
+  "description": "DeskBell \u2014 the front desk that never sleeps. Open-source no-show and missed-call recovery for n8n. Works for any appointment-based business.",
+  "_comment_type": "Deliberately NOT type=module. Every script and test is .mjs so ESM works anyway, while lib/core.js stays CommonJS: it must be require()-able by the tests AND paste cleanly into an n8n Code node, which is neither.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "presets": "node scripts/build-presets.mjs",
+    "build": "npm run presets && node scripts/build-workflows.mjs",
+    "validate": "node scripts/validate-workflows.mjs && node scripts/check-schema.mjs",
+    "test": "node --test tests/",
+    "import": "node scripts/import-workflows.mjs",
+    "check": "npm run build && npm run validate && npm test",
+    "verify": "npm run check && git diff --exit-code -- workflows config"
+  },
+  "keywords": [
+    "n8n",
+    "appointment-reminders",
+    "no-show",
+    "missed-call",
+    "whatsapp",
+    "twilio",
+    "vapi",
+    "automation",
+    "self-hosted"
+  ],
+  "files": [
+    "workflows",
+    "config",
+    "lib",
+    "data",
+    "docs",
+    "scripts"
+  ]
+}

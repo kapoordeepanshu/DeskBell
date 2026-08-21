@@ -1,0 +1,156 @@
+{
+  "$schema": "../config.schema.json",
+  "version": 1,
+  "business": {
+    "name": "Bright Minds Tutoring",
+    "vertical": "tutoring",
+    "timezone": "UTC",
+    "locale": "en",
+    "currency": "USD",
+    "avgAppointmentValue": 45,
+    "bookingUrl": "https://example.com/book",
+    "reviewUrl": "https://g.page/r/example/review",
+    "supportPhone": "+10000000000",
+    "ownerEmail": "owner@example.com",
+    "minLeadTimeHours": 1
+  },
+  "channels": {
+    "priority": [
+      "whatsapp",
+      "sms",
+      "email"
+    ],
+    "whatsapp": {
+      "enabled": true,
+      "provider": "meta-cloud",
+      "costPerMessage": 0.005
+    },
+    "sms": {
+      "enabled": true,
+      "provider": "twilio",
+      "costPerMessage": 0.04
+    },
+    "email": {
+      "enabled": true,
+      "provider": "smtp",
+      "costPerMessage": 0
+    },
+    "voice": {
+      "enabled": false,
+      "provider": "vapi",
+      "costPerMessage": 0.15
+    }
+  },
+  "reminders": [
+    {
+      "stage": "T-24h",
+      "offsetHours": 24,
+      "channels": [
+        "whatsapp"
+      ],
+      "requiresConfirmation": true,
+      "onlyIfUnconfirmed": false
+    },
+    {
+      "stage": "T-1h",
+      "offsetHours": 1,
+      "channels": [
+        "whatsapp",
+        "sms"
+      ],
+      "requiresConfirmation": false,
+      "onlyIfUnconfirmed": false
+    }
+  ],
+  "quietHours": {
+    "enabled": true,
+    "start": "21:00",
+    "end": "08:00",
+    "strategy": "defer"
+  },
+  "escalation": {
+    "voiceEnabled": false,
+    "voiceCallIfUnconfirmedHours": 0,
+    "minValueForVoiceCall": 999999,
+    "maxVoiceAttempts": 0
+  },
+  "missedCall": {
+    "enabled": true,
+    "replyDelaySeconds": 15,
+    "channels": [
+      "sms"
+    ],
+    "createLead": true
+  },
+  "waitlist": {
+    "enabled": true,
+    "offerBatchSize": 5,
+    "offerExpiryMinutes": 30,
+    "maxRounds": 2
+  },
+  "followUp": {
+    "enabled": true,
+    "delayHoursAfterAppointment": 3,
+    "askForRating": true,
+    "publicReviewThreshold": 4
+  },
+  "recall": {
+    "enabled": false,
+    "intervalDays": 0,
+    "channels": []
+  },
+  "compliance": {
+    "stopKeywords": [
+      "STOP",
+      "UNSUBSCRIBE",
+      "CANCEL ALL",
+      "OPTOUT",
+      "OPT OUT"
+    ],
+    "startKeywords": [
+      "START",
+      "SUBSCRIBE",
+      "UNSTOP"
+    ],
+    "helpKeywords": [
+      "HELP",
+      "INFO"
+    ],
+    "requireExplicitConsent": true,
+    "includeOptOutFooter": true,
+    "whatsappSessionWindowHours": 24
+  },
+  "reliability": {
+    "maxSendAttempts": 3,
+    "retryBackoffSeconds": [
+      30,
+      300,
+      1800
+    ],
+    "deadLetterAfterAttempts": 3,
+    "alertChannel": "email"
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "anthropic",
+    "model": "claude-opus-5",
+    "maxTokens": 1024,
+    "escalateBelowConfidence": 0.7
+  },
+  "templates": {
+    "reminder": "Hi {{firstName}}, this is a reminder of your {{serviceName}} appointment at {{businessName}} on {{appointmentDate}} at {{appointmentTime}}. Reply YES to confirm or NO to cancel.",
+    "reminderNoConfirm": "Hi {{firstName}}, see you on {{appointmentDate}} at {{appointmentTime}} for your {{serviceName}} at {{businessName}}.",
+    "confirmed": "Thanks {{firstName}}, you are confirmed for {{appointmentDate}} at {{appointmentTime}}. See you then.",
+    "cancelled": "Your appointment on {{appointmentDate}} at {{appointmentTime}} has been cancelled. Rebook any time: {{bookingUrl}}",
+    "reschedulePrompt": "No problem {{firstName}} — pick a new time here: {{bookingUrl}}",
+    "missedCall": "Hi, this is {{businessName}} — sorry we missed your call. Reply here and we will help, or book directly: {{bookingUrl}}",
+    "missedCallAfterHours": "Hi, this is {{businessName}}. We are closed right now but saw your call. Reply here and we will get back to you first thing, or book online: {{bookingUrl}}",
+    "waitlistOffer": "Hi {{firstName}}, a {{serviceName}} slot just opened on {{appointmentDate}} at {{appointmentTime}}. Reply YES within {{expiryMinutes}} minutes to claim it.",
+    "followUpRating": "Thanks for visiting {{businessName}} today, {{firstName}}. How did we do, 1 to 5?",
+    "reviewRequest": "That is great to hear. Would you mind leaving us a quick review? {{reviewUrl}}",
+    "privateFeedback": "Sorry to hear that. Could you tell us what went wrong? Your reply goes straight to the owner.",
+    "recall": "Hi {{firstName}}, it has been {{intervalDays}} days since your last {{serviceName}} at {{businessName}}. Ready to book again? {{bookingUrl}}",
+    "optOutFooter": " Reply STOP to opt out.",
+    "helpReply": "{{businessName}}: reply YES to confirm an appointment, NO to cancel, or STOP to opt out. Call us on {{supportPhone}}."
+  }
+}

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Unit tests (engine logic)
+        run: npm test
+
+      - name: Rebuild presets and workflows
+        run: npm run build
+
+      - name: Validate workflow structure
+        run: node scripts/validate-workflows.mjs
+
+      - name: Check SQL against schema
+        run: node scripts/check-schema.mjs
+
+      - name: Fail if generated files drift from source
+        run: |
+          if ! git diff --exit-code -- workflows config; then
+            echo "::error::Generated files are out of date. Run 'npm run build' and commit the result."
+            exit 1
+          fi
+
+  schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: deskbell
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply schema to a real Postgres
+        env:
+          PGPASSWORD: ci
+        run: psql -h localhost -U postgres -d deskbell -v ON_ERROR_STOP=1 -f data/schema.sql
+      - name: Apply it twice to prove it is idempotent
+        env:
+          PGPASSWORD: ci
+        run: psql -h localhost -U postgres -d deskbell -v ON_ERROR_STOP=1 -f data/schema.sql
