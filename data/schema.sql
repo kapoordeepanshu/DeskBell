@@ -11,9 +11,40 @@
 --     idempotent rather than creating duplicates every 15 minutes.
 --   * State lives in `status`, driven by the state machine in lib/core.js.
 --     Do not write arbitrary values into it.
+--   * message_log.status separates `sent` (a provider accepted the payload)
+--     from `delivered`/`read` (a receipt says it reached the handset) and
+--     `undelivered` (a receipt says it did not). Those are different facts and
+--     the whole product depends on telling them apart. Receipts arrive out of
+--     order, so every update goes through deskbell.delivery_rank().
+--
+-- Re-running this file on an existing database is safe and is how you upgrade;
+-- the ALTERs below carry older installs forward. CI applies it twice to prove it.
 
 CREATE SCHEMA IF NOT EXISTS deskbell;
 SET search_path TO deskbell, public;
+
+-- ------------------------------------------------------------ delivery rank
+--
+-- How much a message status tells us, lowest to highest certainty. Providers
+-- do not order their callbacks: Twilio's `sent` and `delivered` webhooks
+-- routinely arrive the wrong way round. Every status write compares ranks, so
+-- a late receipt can never walk a message backwards.
+--
+-- A failure ranks above `sent` (it is newer information) but below `delivered`
+-- (a message that reached the handset stays reached).
+--
+-- Mirrors DELIVERY_RANK in lib/core.js. Change both or neither.
+CREATE OR REPLACE FUNCTION deskbell.delivery_rank(status TEXT)
+RETURNS INT LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE lower(coalesce(status, ''))
+    WHEN 'read'        THEN 4
+    WHEN 'delivered'   THEN 3
+    WHEN 'undelivered' THEN 2
+    WHEN 'failed'      THEN 2
+    WHEN 'sent'        THEN 1
+    ELSE 0
+  END;
+$$;
 
 -- ---------------------------------------------------------------- contacts
 
@@ -93,17 +124,39 @@ CREATE TABLE IF NOT EXISTS deskbell.message_log (
   kind                TEXT NOT NULL DEFAULT 'transactional',
   channel             TEXT,
   direction           TEXT NOT NULL DEFAULT 'outbound' CHECK (direction IN ('outbound','inbound')),
-  status              TEXT NOT NULL DEFAULT 'claimed'
-                        CHECK (status IN ('claimed','sent','failed','blocked')),
+  status              TEXT NOT NULL DEFAULT 'claimed',
   body                TEXT,
+  -- The provider's handle for this message. It is the only thing a delivery
+  -- receipt arrives carrying, so every send must record it or the receipt has
+  -- nothing to match against.
   provider_message_id TEXT,
+  -- The provider's own word for the last receipt, kept verbatim next to our
+  -- normalized status so an unfamiliar vocabulary is debuggable rather than lost.
+  provider_status     TEXT,
+  provider_status_at  TIMESTAMPTZ,
   error_code          TEXT,
   error_message       TEXT,
   attempt             INT NOT NULL DEFAULT 1,
   cost                NUMERIC(10,4) NOT NULL DEFAULT 0,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- sent_at: a provider accepted it. delivered_at: a receipt says it landed.
+  -- settled_at: the dispatcher finished with the row. Three different facts.
   sent_at             TIMESTAMPTZ,
-  settled_at          TIMESTAMPTZ
+  delivered_at        TIMESTAMPTZ,
+  settled_at          TIMESTAMPTZ,
+  CONSTRAINT message_log_status_check CHECK (
+    status IN ('claimed','sent','delivered','read','undelivered','failed','blocked')
+  )
+);
+
+-- Upgrade path for databases created before delivery receipts existed. Named
+-- explicitly so the drop-and-recreate below is idempotent on every run.
+ALTER TABLE deskbell.message_log ADD COLUMN IF NOT EXISTS provider_status    TEXT;
+ALTER TABLE deskbell.message_log ADD COLUMN IF NOT EXISTS provider_status_at TIMESTAMPTZ;
+ALTER TABLE deskbell.message_log ADD COLUMN IF NOT EXISTS delivered_at       TIMESTAMPTZ;
+ALTER TABLE deskbell.message_log DROP CONSTRAINT IF EXISTS message_log_status_check;
+ALTER TABLE deskbell.message_log ADD  CONSTRAINT message_log_status_check CHECK (
+  status IN ('claimed','sent','delivered','read','undelivered','failed','blocked')
 );
 
 CREATE INDEX IF NOT EXISTS message_log_appointment_idx ON deskbell.message_log (appointment_id);
@@ -111,6 +164,17 @@ CREATE INDEX IF NOT EXISTS message_log_contact_stage_idx ON deskbell.message_log
 -- Finds sends that were claimed but never settled (a crash mid-dispatch).
 CREATE INDEX IF NOT EXISTS message_log_stuck_idx ON deskbell.message_log (created_at)
   WHERE status = 'claimed';
+-- Delivery receipts arrive keyed on the provider's id and nothing else. Every
+-- receipt is one lookup on this index; without it they are a sequential scan
+-- of every message ever sent, several times per outbound message.
+CREATE INDEX IF NOT EXISTS message_log_provider_msg_idx
+  ON deskbell.message_log (provider_message_id)
+  WHERE provider_message_id IS NOT NULL;
+-- Drives the scheduler's per-stage delivery lookup and the digest's split of
+-- "never reached" out of "unconfirmed".
+CREATE INDEX IF NOT EXISTS message_log_appointment_stage_idx
+  ON deskbell.message_log (appointment_id, stage)
+  WHERE direction = 'outbound';
 
 -- --------------------------------------------------------- inbound messages
 
@@ -289,3 +353,15 @@ SELECT id, idempotency_key, appointment_id, stage, created_at,
 FROM deskbell.message_log
 WHERE status = 'claimed' AND created_at < now() - interval '1 hour'
 ORDER BY created_at;
+
+-- Messages a provider accepted and then told us never arrived. This is an
+-- operational fault list, not a customer list: a number that keeps appearing
+-- here is wrong in the booking system and no amount of resending will fix it.
+CREATE OR REPLACE VIEW deskbell.v_undelivered AS
+SELECT m.id, m.appointment_id, m.contact_id, m.stage, m.channel,
+       m.provider_status, m.error_code, m.error_message,
+       m.provider_status_at, c.phone, c.name
+FROM deskbell.message_log m
+LEFT JOIN deskbell.contacts c ON c.id = m.contact_id
+WHERE m.direction = 'outbound' AND m.status = 'undelivered'
+ORDER BY m.provider_status_at DESC NULLS LAST;

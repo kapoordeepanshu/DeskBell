@@ -141,7 +141,8 @@
       1800
     ],
     "deadLetterAfterAttempts": 3,
-    "alertChannel": "email"
+    "alertChannel": "email",
+    "maxRedeliveryAttempts": 1
   },
   "ai": {
     "enabled": false,

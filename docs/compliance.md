@@ -225,14 +225,21 @@ Everything is recorded, which is what lets you answer a complaint:
 
 | Table | Answers |
 |---|---|
-| `message_log` | Every send attempt, its idempotency key, channel, body, cost, and outcome |
+| `message_log` | Every send attempt, its idempotency key, channel, body, cost, and outcome — including whether a provider receipt says it reached the handset |
 | `inbound_messages` | Every reply, with the classified intent and confidence |
 | `events` | Consent changes, confirmations, cancellations, opt-outs |
 | `contacts.opted_out_at` | Exactly when someone opted out |
 | `dead_letters` | Every failure, classified |
 
 "Why did my patient get a text at 11pm?" is answerable in one query. That is the
-point.
+point. So is "you never told me about the appointment" — `message_log.status`
+and `delivered_at` record whether the provider says it arrived, rather than only
+that you asked it to be sent.
+
+Delivery receipts themselves carry no message content: a provider id, a status
+word, and an error code when there is one. They are stored on the row that
+already exists for that message, so they add nothing to erase that erasure did
+not already cover.
 
 ---
 

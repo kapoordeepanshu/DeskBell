@@ -53,7 +53,7 @@ Create an API key in n8n (**Settings → API → Create an API key**), add it to
 npm run import
 ```
 
-This creates all 11 workflows and wires the sub-workflow references between
+This creates all 12 workflows and wires the sub-workflow references between
 them. Re-running it later updates them in place without touching your
 credentials.
 
@@ -109,6 +109,27 @@ than silently sending nothing.
 
 You need at least one. Start with whichever you already have.
 
+### One number, not four
+
+Before you connect anything: `TWILIO_FROM_NUMBER`, `WHATSAPP_PHONE_NUMBER_ID`,
+`VAPI_PHONE_NUMBER_ID` and `DESKBELL_FROM_EMAIL` are four separate sender
+identities, and DeskBell will use all of them on one person about one
+appointment — WhatsApp first, SMS when that falls through, a voice call if the
+booking is valuable enough.
+
+Register **the same phone number** on Twilio, Meta and VAPI. Meta lets you
+onboard a number you already own on Twilio, and VAPI lets you set the outbound
+caller ID. It takes a few minutes and it decides whether the ladder reads as one
+business or as three strangers.
+
+There is a functional reason too, not only a cosmetic one: a reply only reaches
+DeskBell if it comes back to a number pointed at the inbound webhook. A fallback
+SMS sent from an unmonitored number cannot be confirmed, cancelled or STOPped.
+It costs money and can only ever be a dead end.
+
+If the numbers genuinely have to differ, put the one a customer would recognise
+in `business.supportPhone` so the message body names it.
+
 ### Twilio SMS
 
 **n8n → Credentials → New → Header Auth** is *not* what you want here. Create a
@@ -131,7 +152,8 @@ In the Twilio console, on your number:
 | **A message comes in** | `{DESKBELL_BASE_URL}/webhook/deskbell/inbound` |
 | **Call status changes** | `{DESKBELL_BASE_URL}/webhook/deskbell/call-status` |
 
-The second one is what powers missed-call recovery.
+The second one is what powers missed-call recovery. Delivery receipts need no
+setting here — workflow 03 attaches the callback URL to each message it sends.
 
 ### WhatsApp Business Cloud API
 
@@ -150,6 +172,44 @@ In Meta's dashboard, subscribe the webhook to
 > **pre-approved template**. DeskBell detects this and falls through to SMS rather
 > than failing, but you should submit templates for your reminder copy — see
 > [`compliance.md`](compliance.md).
+
+### Delivery receipts
+
+`sent` means Twilio or Meta accepted the message. It is not the same fact as
+"the phone showed it", and DeskBell needs both — a no-show engine exists to tell
+*she saw it and didn't reply* apart from *it never arrived*, which are opposite
+problems with opposite fixes.
+
+**Twilio** needs nothing from you. Workflow 03 puts a `StatusCallback` on every
+SMS pointing at `{DESKBELL_BASE_URL}/webhook/deskbell/message-status`, which is
+**deskbell/11 Delivery Receipts**. Activate that workflow and receipts start
+landing.
+
+> If you ran DeskBell before workflow 11 existed, Twilio has been posting every
+> receipt at a 404 this whole time. Importing and activating 11 is the fix; there
+> is nothing to clean up.
+
+**WhatsApp Cloud** allows one webhook URL per app, so its receipts arrive at
+`/webhook/deskbell/inbound` mixed in with the replies. Workflow 04 recognises
+them and hands them to workflow 11 — again, nothing to configure, but **both**
+workflows must be active.
+
+What changes once receipts are flowing:
+
+| | Without receipts | With receipts |
+|---|---|---|
+| A message the provider accepted but never delivered | recorded as `sent`, stage marked done, never retried | recorded as `undelivered`, retried **on another channel** |
+| The digest's unconfirmed list | one list | split into *reached, no reply* and *never reached* |
+| A wrong phone number | invisible until someone doesn't turn up | `SELECT * FROM deskbell.v_undelivered;` |
+
+Channels differ in what they will tell you. Twilio SMS reports `delivered` and
+`undelivered`; WhatsApp adds `read`; email reports nothing at all. A message on
+a channel with no receipts stays `sent`, and every part of DeskBell treats that
+as *unknown* rather than pretending it arrived.
+
+`reliability.maxRedeliveryAttempts` in the config (default `1`) caps the retry.
+Above 1 you are mostly paying to learn the same thing about a number that is
+simply wrong.
 
 ### Email
 
@@ -246,14 +306,23 @@ Watch the first morning's digest. If `avgAppointmentValue` is set honestly, the
 | Replies not recognised | Look in `deskbell.inbound_messages` — if `intent` is `unknown`, the wording is not in the regex. Add it to `lib/core.js`, run `npm run build`, re-import. |
 | WhatsApp fails, SMS works | Almost always the 24-hour window. Check the dispatcher's "Consent Gate & Plan Attempts" output for `whatsapp_session_closed_no_template`. |
 | Sends stuck in `claimed` | A crash mid-dispatch. `SELECT * FROM deskbell.v_stuck_sends;` shows them. |
+| Nothing is ever `delivered` | Workflow 11 is inactive, or `DESKBELL_BASE_URL` is not publicly reachable, so the provider's callback never lands. Everything stays `sent`, which DeskBell reads as *unknown* — correct, but blind. |
+| The same customer is reminded twice for one stage | Expected when the first attempt came back `undelivered`: the retry goes out on another channel. `reliability.maxRedeliveryAttempts: 0` turns it off. |
+| A number keeps appearing in `v_undelivered` | It is wrong in the booking system. No amount of resending fixes that; correct it at the source. |
 
 ## Upgrading
 
 ```bash
 git pull
+psql "$DATABASE_URL" -f data/schema.sql   # safe to re-run; this is the upgrade
 npm run build      # regenerate workflows from lib/core.js
 npm run import     # push them into n8n
 ```
+
+`data/schema.sql` is idempotent and re-running it is how you take schema
+changes. It adds columns with `IF NOT EXISTS` and re-establishes constraints by
+name, so applying it to an existing database changes nothing it does not have
+to. CI applies it twice on every commit to keep that true.
 
 `npm run build` bakes `config/config.json` into workflow 00 if that file exists,
 falling back to `config.example.json` otherwise. So keep your real settings in

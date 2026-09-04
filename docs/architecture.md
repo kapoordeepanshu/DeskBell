@@ -37,6 +37,10 @@ to get wrong.
                  ┌────────────────────────┐
                  │ 09 Error Handler       │◀── error workflow for all of the above
                  └────────────────────────┘
+                 ┌────────────────────────┐
+                 │ 11 Delivery Receipts   │──▶ writes back to message_log
+                 │ (webhook + from 04)    │    what actually reached the phone
+                 └────────────────────────┘
 ```
 
 Two rules hold this together:
@@ -58,7 +62,7 @@ repo:
 | | Logic in the node graph | Logic in `lib/core.js` |
 |---|---|---|
 | Reviewable in a PR | A 40-node diff nobody reads | A readable function diff |
-| Testable | Only by running the workflow | 63 unit tests, `npm test` |
+| Testable | Only by running the workflow | 78 unit tests, `npm test` |
 | Consistent across workflows | Three drifting copies of the quiet-hours check | One implementation, inlined everywhere |
 | Portable across n8n versions | Node parameter schemas change | Plain JavaScript |
 
@@ -66,7 +70,7 @@ Every function is pure — `now` is always a parameter, never `new Date()` insid
 That is what makes DST and quiet-hours behaviour testable at all.
 
 ```bash
-npm test       # 63 tests against the engine
+npm test       # 78 tests against the engine
 npm run build  # regenerate the workflows from it
 npm run verify # build + validate + test + fail if generated files drifted
 ```
@@ -145,14 +149,103 @@ which stage produced it. Uniqueness is the requirement; opacity is not.
 A failed send deliberately does **not** append to `sent_stages`:
 
 ```sql
-sent_stages = CASE WHEN $2::boolean AND $3 <> 'voice'
+sent_stages = CASE WHEN $2::boolean AND $3 <> 'voice' AND NOT ($3 = ANY(sent_stages))
                    THEN array_append(sent_stages, $3) ELSE sent_stages END
 ```
 
-So the next 15-minute tick retries it — on the next channel in the ladder, since
-the previous failure is recorded. The idempotency key is already consumed for
-that attempt, which is why the dispatcher walks the whole ladder within a single
-execution rather than relying on the retry.
+The dispatcher walks the whole channel ladder inside a single execution, so most
+failures are already recovered by the time workflow 02 sees a result. What is
+left over — every channel refused, or the message accepted and then never
+delivered — needs a *later* attempt, and that is where the guarantee and the
+retry pull against each other: the first attempt already holds
+`appt_412|T-24h`, so a naive retry hits `ON CONFLICT DO NOTHING` and dies
+without a word.
+
+So a retry claims a key of its own:
+
+```js
+idempotencyKey('appt_412', 'T-24h', 'r1')   // -> "appt_412|T-24h|r1"
+```
+
+The discriminator is the number of attempts already logged for that stage, which
+makes the key both unique and readable, and caps the retries at
+`reliability.maxRedeliveryAttempts` without needing a counter anywhere.
+
+## Sent is not delivered
+
+`sent` is a claim about a provider: Twilio or Meta accepted the payload and
+returned an id. It says nothing about whether a handset ever showed the message.
+
+Conflating the two is the failure this system can least afford. DeskBell exists
+to tell **"she read it and didn't reply"** apart from **"it never arrived"** —
+and in a log where both are `sent` with no reply recorded, they are the same
+row. The T-3h reminder fires identically for both. So does the digest's
+unconfirmed list. So does every judgement either of them supports.
+
+So `message_log.status` carries the whole lifecycle:
+
+| Status | Means |
+|---|---|
+| `claimed` | The row exists, no provider has been contacted |
+| `sent` | A provider accepted it and gave us an id |
+| `delivered` | A receipt says it reached the handset |
+| `read` | A receipt says it was opened (WhatsApp only) |
+| `undelivered` | A receipt says it did not arrive |
+| `failed` | The provider refused it |
+| `blocked` | The consent gate stopped it before any provider saw it |
+
+and three separate timestamps that are routinely confused for one another:
+`sent_at` (a provider took it), `delivered_at` (a receipt says it landed) and
+`settled_at` (the dispatcher finished with the row).
+
+### Receipts arrive out of order
+
+Providers do not order their callbacks. Twilio's `sent` and `delivered` webhooks
+routinely arrive the wrong way round, callbacks are retried, and one message can
+produce four of them.
+
+Every status write — in workflow 11, and in every settle in 02, 05, 07 and 08 —
+goes through the same comparison:
+
+```sql
+WHERE deskbell.delivery_rank($2) > deskbell.delivery_rank(status)
+```
+
+`delivery_rank()` orders the statuses by how much they tell us, so the write is
+monotonic: a late `sent` cannot undo a `delivered`, a duplicate updates nothing,
+and a settle that lands after a receipt leaves the receipt alone. Failures rank
+above `sent` because they are newer information, and below `delivered` because a
+message that reached the handset stays reached.
+
+The same ordering exists twice on purpose — `DELIVERY_RANK` in `lib/core.js` and
+`deskbell.delivery_rank()` in SQL — because both the engine and the database need
+it and neither can call the other. They are commented as a pair; change both or
+neither.
+
+### What a receipt is for
+
+Recording delivery would be a reporting nicety if nothing acted on it. Three
+things do:
+
+1. **An `undelivered` stage is retried on a different channel.** Without this,
+   "the provider took it" is treated as "she got it", `sent_stages` records the
+   stage as done, and a dead number silently swallows the entire ladder.
+2. **The daily digest splits its unconfirmed list.** *Reached, no reply* is a
+   customer to chase. *Never reached* is a wrong number in the booking system,
+   and chasing it harder achieves nothing.
+3. **`deskbell.v_undelivered` becomes an operational fault list** — the numbers
+   to fix at the source.
+
+### What it cannot tell you
+
+Channels differ in what they report. Twilio SMS gives `delivered` and
+`undelivered`; WhatsApp adds `read`; email reports nothing at all.
+
+A message on a channel with no receipts stays `sent` forever, and `sent` means
+**unknown** everywhere it is read — not "delivered", and not "failed".
+`deliveryOutcome()` returns `unknown` for it, the digest leaves it in the plain
+unconfirmed list, and no retry is triggered. Pretending otherwise would trade
+one wrong answer for a different one.
 
 ## The reminder window
 
@@ -178,9 +271,14 @@ So T-7d only fires between 7 days and 24 hours out; T-24h only between 24 and 3
 hours. A missed window is missed, not fired late.
 
 Every decision returns an explicit **reason** — `already_sent`, `too_late`,
-`quiet_hours_deferred`, `window_missed`, `below_value_threshold`. Nothing is
-silently dropped, which is what makes "why didn't Mrs Kaur get her reminder?"
-answerable by looking at one node's output.
+`quiet_hours_deferred`, `window_missed`, `attempt_in_flight`,
+`redelivery_exhausted`, `below_value_threshold`. Nothing is silently dropped,
+which is what makes "why didn't Mrs Kaur get her reminder?" answerable by
+looking at one node's output.
+
+That includes decisions the *database* would refuse. A stage whose claim is
+still held by an unsettled attempt reports `attempt_in_flight` rather than
+`due`, because a `due` the claim then silently overrules is a log that lies.
 
 ## The channel ladder
 
@@ -209,7 +307,7 @@ worth $45 never justifies a $0.15 voice call; a $350 auto-repair bay does.
 |---|---|---|
 | `contacts` | People | `phone` UNIQUE — the natural key across every provider |
 | `appointments` | Bookings | `external_id` UNIQUE; `sent_stages[]` resets when the time moves |
-| `message_log` | Every send attempt | `idempotency_key` UNIQUE — the guarantee |
+| `message_log` | Every send attempt | `idempotency_key` UNIQUE — the guarantee; `status` carries `claimed` → `sent` → `delivered`/`undelivered` |
 | `inbound_messages` | Every reply | With classified intent and confidence |
 | `events` | Append-only ROI feed | Never updated in place |
 | `leads` | Missed callers | Deduped to one per caller per hour |
@@ -218,9 +316,13 @@ worth $45 never justifies a $0.15 voice call; a $350 auto-repair bay does.
 | `dead_letters` | Classified failures | Retryable vs permanent |
 | `call_logs` | Voice outcomes | Structured data from VAPI |
 
-Three views ship for operations: `v_today`, `v_no_show_rate`, `v_stuck_sends`.
-The last one finds sends claimed but never settled — the signature of a crash
-mid-dispatch.
+Four views ship for operations: `v_today`, `v_no_show_rate`, `v_stuck_sends` and
+`v_undelivered`. The last two answer different questions and are easy to
+confuse: `v_stuck_sends` finds sends *our dispatcher* abandoned mid-flight,
+`v_undelivered` finds sends a *provider* told us never arrived.
+
+One function ships too — `deskbell.delivery_rank(text)`, which every status
+write compares against.
 
 ### Why Postgres and not Google Sheets
 

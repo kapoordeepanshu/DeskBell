@@ -20,6 +20,7 @@ const schemaSql = readFileSync(join(ROOT, 'data', 'schema.sql'), 'utf8');
 
 const tables = new Map();
 const views = new Set();
+const functions = new Set();
 
 for (const m of schemaSql.matchAll(
   /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?deskbell\.(\w+)\s*\(([\s\S]*?)\n\);/gi,
@@ -55,6 +56,10 @@ for (const m of schemaSql.matchAll(/CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+deskbell
   views.add(m[1].toLowerCase());
 }
 
+for (const m of schemaSql.matchAll(/CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+deskbell\.(\w+)/gi)) {
+  functions.add(m[1].toLowerCase());
+}
+
 /* ---------- collect SQL from the workflows ---------- */
 
 const WF_DIR = join(ROOT, 'workflows');
@@ -71,7 +76,7 @@ for (const file of readdirSync(WF_DIR).filter((f) => f.endsWith('.json'))) {
 /* ---------- checks ---------- */
 
 const errors = [];
-const known = (t) => tables.has(t) || views.has(t);
+const known = (t) => tables.has(t) || views.has(t) || functions.has(t);
 
 for (const { file, node, sql } of statements) {
   const where = `${file} › ${node}`;
@@ -132,7 +137,7 @@ for (const { file, node, sql } of statements) {
 
 for (const e of errors) console.error(`  FAIL  ${e}`);
 console.log(
-  `\n${tables.size} tables, ${views.size} views in schema; ` +
+  `\n${tables.size} tables, ${views.size} views, ${functions.size} functions in schema; ` +
   `${statements.length} SQL nodes checked — ${errors.length} error(s).`,
 );
 process.exit(errors.length ? 1 : 0);

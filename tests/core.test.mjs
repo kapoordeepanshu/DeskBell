@@ -431,6 +431,198 @@ test('intent maps to the right state event', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Delivery receipts
+ *
+ * "Sent" is a claim about a provider. "Delivered" is a claim about a handset.
+ * Everything below exists to keep those two apart.
+ * ------------------------------------------------------------------ */
+
+test('provider vocabularies map onto one set of statuses', () => {
+  // Twilio.
+  assert.equal(S.normalizeDeliveryStatus('queued'), 'sent');
+  assert.equal(S.normalizeDeliveryStatus('delivered'), 'delivered');
+  assert.equal(S.normalizeDeliveryStatus('undelivered'), 'undelivered');
+  assert.equal(S.normalizeDeliveryStatus('failed'), 'failed');
+  // WhatsApp Cloud.
+  assert.equal(S.normalizeDeliveryStatus('read'), 'read');
+  assert.equal(S.normalizeDeliveryStatus('sent'), 'sent');
+  // Case and padding come off the wire in every shape.
+  assert.equal(S.normalizeDeliveryStatus('  DELIVERED '), 'delivered');
+});
+
+test('an unrecognised status is refused rather than guessed at', () => {
+  assert.equal(S.normalizeDeliveryStatus('teleported'), null);
+  assert.equal(S.normalizeDeliveryStatus(''), null);
+  assert.equal(S.normalizeDeliveryStatus(undefined), null);
+
+  const r = S.advanceDeliveryStatus('sent', 'teleported');
+  assert.equal(r.changed, false, 'a word we do not know must not move the message');
+  assert.equal(r.status, 'sent');
+  assert.match(r.reason, /^unknown_status:/);
+});
+
+test('receipts are monotonic, because providers do not order their callbacks', () => {
+  // Twilio's sent and delivered webhooks routinely arrive the wrong way round.
+  assert.equal(S.advanceDeliveryStatus('sent', 'delivered').status, 'delivered');
+  assert.equal(S.advanceDeliveryStatus('delivered', 'sent').status, 'delivered');
+  assert.equal(S.advanceDeliveryStatus('delivered', 'sent').changed, false);
+
+  // A duplicate of the receipt we already applied changes nothing.
+  const dup = S.advanceDeliveryStatus('delivered', 'delivered');
+  assert.equal(dup.changed, false);
+  assert.match(dup.reason, /^not_newer:/);
+
+  // Read outranks delivered; a failure outranks sent but never a delivery.
+  assert.equal(S.advanceDeliveryStatus('delivered', 'read').status, 'read');
+  assert.equal(S.advanceDeliveryStatus('sent', 'undelivered').status, 'undelivered');
+  assert.equal(S.advanceDeliveryStatus('delivered', 'failed').status, 'delivered');
+});
+
+test('a claimed-but-unsettled row can still be advanced by a receipt', () => {
+  assert.equal(S.advanceDeliveryStatus('claimed', 'sent').status, 'sent');
+  assert.equal(S.advanceDeliveryStatus(null, 'delivered').status, 'delivered');
+});
+
+test('outcome separates reached, not reached, and genuinely unknown', () => {
+  assert.equal(S.deliveryOutcome('delivered'), 'reached');
+  assert.equal(S.deliveryOutcome('read'), 'reached');
+  assert.equal(S.deliveryOutcome('undelivered'), 'not_reached');
+  // The honest answer for a message a provider took and never reported on,
+  // and for every send on a channel that has no receipts at all.
+  assert.equal(S.deliveryOutcome('sent'), 'unknown');
+  assert.equal(S.deliveryOutcome('claimed'), 'unknown');
+  // A provider that refused the message is also a message nobody received.
+  assert.equal(S.deliveryOutcome('failed'), 'not_reached');
+});
+
+/* ------------------------------------------------------------------ *
+ * Redelivery — what a receipt is actually for
+ * ------------------------------------------------------------------ */
+
+const undeliveredT24 = { 'T-24h': { status: 'undelivered', attempts: 1, channel: 'sms' } };
+
+test('a stage the receipt says never arrived is retried', () => {
+  const now = '2026-03-11T12:00:00Z';
+  const a = appt({ sentStages: ['T-24h'], delivery: undeliveredT24 });
+  const d = S.evaluateReminders(a, cfg(), now);
+  assert.deepEqual(dueStages(d), ['T-24h']);
+  assert.equal(reasonFor(d, 'T-24h'), 'redelivering_after_undelivered');
+});
+
+test('the retry does not reuse the claim the failed attempt already holds', () => {
+  const now = '2026-03-11T12:00:00Z';
+  const first = S.evaluateReminders(appt(), cfg(), now).find((x) => x.stage === 'T-24h');
+  const retry = S.evaluateReminders(appt({ sentStages: ['T-24h'], delivery: undeliveredT24 }), cfg(), now)
+    .find((x) => x.stage === 'T-24h');
+  assert.notEqual(retry.idempotencyKey, first.idempotencyKey);
+  assert.match(retry.idempotencyKey, /\|r1$/);
+  assert.equal(retry.attempt, 2);
+});
+
+test('the retry excludes the channel that did not deliver', () => {
+  const d = S.evaluateReminders(
+    appt({ sentStages: ['T-24h'], delivery: undeliveredT24 }), cfg(), '2026-03-11T12:00:00Z',
+  );
+  assert.deepEqual(d.find((x) => x.stage === 'T-24h').excludeChannels, ['sms']);
+});
+
+test('redelivery is capped, so a dead number is not chased forever', () => {
+  const now = '2026-03-11T12:00:00Z';
+  const twice = { 'T-24h': { status: 'undelivered', attempts: 2, channel: 'sms' } };
+  const d = S.evaluateReminders(appt({ sentStages: ['T-24h'], delivery: twice }), cfg(), now);
+  assert.deepEqual(dueStages(d), []);
+  assert.equal(reasonFor(d, 'T-24h'), 'redelivery_exhausted');
+});
+
+test('a delivered stage is never sent twice, and neither is an unreported one', () => {
+  const now = '2026-03-11T12:00:00Z';
+  for (const status of ['delivered', 'read', 'sent']) {
+    const d = S.evaluateReminders(
+      appt({ sentStages: ['T-24h'], delivery: { 'T-24h': { status, attempts: 1, channel: 'sms' } } }),
+      cfg(), now,
+    );
+    assert.deepEqual(dueStages(d), [], `${status} must not resend`);
+    assert.equal(reasonFor(d, 'T-24h'), 'already_sent');
+  }
+});
+
+test('an undelivered reminder still respects every other gate', () => {
+  const now = '2026-03-11T12:00:00Z';
+  // Cancelled beats a redelivery: the appointment is gone.
+  const cancelled = S.evaluateReminders(
+    appt({ status: 'cancelled', sentStages: ['T-24h'], delivery: undeliveredT24 }), cfg(), now,
+  );
+  assert.deepEqual(dueStages(cancelled), []);
+  assert.match(reasonFor(cancelled, 'T-24h'), /^terminal_state:/, 'and says so');
+  // So does opting out.
+  const out = S.evaluateReminders(
+    appt({ optedOut: true, sentStages: ['T-24h'], delivery: undeliveredT24 }), cfg(), now,
+  );
+  assert.deepEqual(dueStages(out), []);
+  assert.equal(reasonFor(out, 'T-24h'), 'opted_out', 'consent outranks a retry, and reports honestly');
+  // And so does the stage window: no "see you tomorrow" three hours before.
+  const late = S.evaluateReminders(
+    appt({ sentStages: ['T-24h'], delivery: undeliveredT24 }), cfg(), '2026-03-12T07:30:00Z',
+  );
+  assert.equal(reasonFor(late, 'T-24h'), 'window_missed');
+});
+
+test('a send the provider refused is retried, not abandoned', () => {
+  // Before delivery receipts existed this was a silent dead end: the stage was
+  // never marked sent, so it looked due forever, and the claim it already held
+  // dropped every retry on the floor. Nobody was reminded and nothing said so.
+  const now = '2026-03-11T12:00:00Z';
+  const d = S.evaluateReminders(
+    appt({ delivery: { 'T-24h': { status: 'failed', attempts: 1, channel: 'whatsapp' } } }),
+    cfg(), now,
+  );
+  assert.deepEqual(dueStages(d), ['T-24h']);
+  const retry = d.find((x) => x.stage === 'T-24h');
+  assert.match(retry.idempotencyKey, /\|r1$/, 'must not reuse the claim the refused attempt holds');
+  assert.deepEqual(retry.excludeChannels, ['whatsapp']);
+});
+
+test('an attempt still in flight is reported, not silently overruled', () => {
+  // The claim on this stage is held by a send that has not settled. Calling it
+  // "due" would be a decision the database quietly refuses; say so instead.
+  const now = '2026-03-11T12:00:00Z';
+  const d = S.evaluateReminders(
+    appt({ delivery: { 'T-24h': { status: 'claimed', attempts: 1, channel: null } } }),
+    cfg(), now,
+  );
+  assert.deepEqual(dueStages(d), []);
+  assert.equal(reasonFor(d, 'T-24h'), 'attempt_in_flight');
+});
+
+test('appointments with no delivery information behave exactly as before', () => {
+  const now = '2026-03-11T12:00:00Z';
+  const withNothing = S.evaluateReminders(appt({ sentStages: ['T-24h'] }), cfg(), now);
+  assert.equal(reasonFor(withNothing, 'T-24h'), 'already_sent');
+  assert.deepEqual(dueStages(S.evaluateReminders(appt(), cfg(), now)), ['T-24h']);
+});
+
+test('delivery rows survive the shapes Postgres hands back', () => {
+  const asObject = S.normalizeAppointment({
+    id: 1, start_at: '2026-03-12T10:00:00Z',
+    delivery: { 'T-24h': { status: 'undelivered', attempts: '2', channel: 'sms' } },
+  });
+  assert.equal(asObject.delivery['T-24h'].status, 'undelivered');
+  assert.equal(asObject.delivery['T-24h'].attempts, 2, 'counts arrive as strings over some drivers');
+
+  const asString = S.normalizeAppointment({
+    id: 1, start_at: '2026-03-12T10:00:00Z',
+    delivery: '{"T-24h":{"status":"delivered","attempts":1,"channel":"whatsapp"}}',
+  });
+  assert.equal(asString.delivery['T-24h'].status, 'delivered');
+
+  // Missing, null and malformed all mean the same thing: we know nothing.
+  assert.deepEqual(S.normalizeAppointment({ id: 1 }).delivery, {});
+  assert.deepEqual(S.normalizeAppointment({ id: 1, delivery: null }).delivery, {});
+  assert.deepEqual(S.normalizeAppointment({ id: 1, delivery: 'not json' }).delivery, {});
+  assert.deepEqual(S.normalizeAppointment({ id: 1, delivery: [1, 2] }).delivery, {});
+});
+
+/* ------------------------------------------------------------------ *
  * Failure classification and retry
  * ------------------------------------------------------------------ */
 

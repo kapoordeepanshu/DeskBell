@@ -44,6 +44,7 @@ const PLACEHOLDERS = {
   __DESKBELL_WF_06_VOICE__: 'deskbell/06 Voice Agent (VAPI)',
   __DESKBELL_WF_08_WAITLIST__: 'deskbell/08 Waitlist Gap-fill',
   __DESKBELL_WF_09_ERRORS__: 'deskbell/09 Error Handler',
+  __DESKBELL_WF_11_RECEIPTS__: 'deskbell/11 Delivery Receipts',
 };
 
 const PG_CREDENTIAL_NAME = 'deskbell postgres';

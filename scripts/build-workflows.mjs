@@ -44,6 +44,7 @@ const WF = {
   voice: '__DESKBELL_WF_06_VOICE__',
   waitlist: '__DESKBELL_WF_08_WAITLIST__',
   errors: '__DESKBELL_WF_09_ERRORS__',
+  receipts: '__DESKBELL_WF_11_RECEIPTS__',
 };
 
 const PG = { postgres: { id: '__DESKBELL_PG_CRED__', name: 'deskbell postgres' } };
@@ -275,9 +276,27 @@ define(() => {
     `SELECT a.id, a.external_id, a.start_at, a.status, a.confirmed_at, a.value,
        a.voice_attempts, a.sent_stages, a.service_name,
        c.id AS contact_id, c.first_name, c.name, c.phone, c.whatsapp, c.email,
-       c.opted_out, c.consent_at, c.marketing_consent, c.last_inbound_at, c.pet_name
+       c.opted_out, c.consent_at, c.marketing_consent, c.last_inbound_at, c.pet_name,
+       d.delivery
 FROM deskbell.appointments a
 JOIN deskbell.contacts c ON c.id = a.contact_id
+LEFT JOIN LATERAL (
+  -- What actually happened to each stage, not merely what we attempted. A stage
+  -- a receipt reported as undelivered is owed another try on another channel;
+  -- without this the scheduler treats "the provider took it" as "she got it"
+  -- and a dead number silently swallows the whole ladder.
+  SELECT jsonb_object_agg(t.stage, jsonb_build_object(
+           'status', t.status, 'attempts', t.attempts, 'channel', t.channel)) AS delivery
+  FROM (
+    SELECT m.stage,
+           count(*) AS attempts,
+           (array_agg(m.status  ORDER BY deskbell.delivery_rank(m.status) DESC))[1] AS status,
+           (array_agg(m.channel ORDER BY m.created_at DESC))[1]                     AS channel
+    FROM deskbell.message_log m
+    WHERE m.appointment_id = a.id AND m.direction = 'outbound'
+    GROUP BY m.stage
+  ) t
+) d ON true
 WHERE a.start_at > now()
   AND a.start_at < now() + interval '8 days'
   AND a.status NOT IN ('cancelled', 'completed', 'no_show', 'rescheduled')
@@ -318,6 +337,9 @@ for (const item of $input.all()) {
         contactId: appt.contact.id,
         stage: decision.stage,
         channels: decision.channels,
+        // Set only on a redelivery: the channel a receipt said did not land.
+        excludeChannels: decision.excludeChannels || [],
+        attempt: decision.attempt || 1,
         templateKey,
         contact: appt.contact,
         vars: {
@@ -367,10 +389,10 @@ return tasks;`), { pos: [920, 300] });
 -- guarantee, enforced by the database rather than by hoping.
 INSERT INTO deskbell.message_log
   (idempotency_key, appointment_id, contact_id, stage, kind, direction, status, attempt)
-VALUES ($1, $2::bigint, $3::bigint, $4, $5, 'outbound', 'claimed', 1)
+VALUES ($1, $2::bigint, $3::bigint, $4, $5, 'outbound', 'claimed', $6::int)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING id, idempotency_key;`,
-    '={{ $json.idempotencyKey }},{{ $json.appointmentId }},{{ $json.contactId }},{{ $json.stage }},{{ $json.kind }}',
+    '={{ $json.idempotencyKey }},{{ $json.appointmentId }},{{ $json.contactId }},{{ $json.stage }},{{ $json.kind }},{{ $json.attempt || 1 }}',
   ), { pos: [1140, 300], ...withPg, alwaysOutputData: false });
 
   w.add('code', 'Attach Claim', jsCode(`${HEADER('deskbell/02 — keep only tasks that won the claim')}
@@ -400,6 +422,10 @@ return [{
     stage: task.stage,
     kind: task.kind,
     sent: result.sent === true,
+    // 'sent' is a claim about the provider, not about the handset. A delivery
+    // receipt may upgrade it to delivered/read or contradict it with
+    // undelivered; the settle below never overwrites a higher-ranked status.
+    settleStatus: result.sent === true ? 'sent' : 'failed',
     channel: result.channel || null,
     providerMessageId: result.providerMessageId || null,
     body: result.body || null,
@@ -409,20 +435,24 @@ return [{
 }];`), { pos: [2020, 400] });
 
   w.add('postgres', 'Settle Message Log', sql(
-    `UPDATE deskbell.message_log
-SET status = CASE WHEN $2::boolean THEN 'sent' ELSE 'failed' END,
+    `-- A provider can call the status webhook before this row is settled, so the
+-- status write is guarded by delivery_rank(): whatever we learned first from
+-- the receipt outranks "we handed it over" and is left alone.
+UPDATE deskbell.message_log
+SET status = CASE WHEN deskbell.delivery_rank(status) > deskbell.delivery_rank($8)
+                  THEN status ELSE $8 END,
     channel = $3, provider_message_id = $4, body = $5, error_message = $6,
     cost = $7::numeric, sent_at = CASE WHEN $2::boolean THEN now() ELSE NULL END,
     settled_at = now()
 WHERE id = $1::bigint;`,
-    '={{ $json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.providerMessageId }},{{ $json.body }},{{ $json.errorMessage }},{{ $json.cost }}',
+    '={{ $json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.providerMessageId }},{{ $json.body }},{{ $json.errorMessage }},{{ $json.cost }},{{ $json.settleStatus }}',
   ), { pos: [2240, 400], ...withPg });
 
   w.add('postgres', 'Advance Appointment', sql(
     `-- Only a genuinely sent reminder marks the stage done. A failed send leaves
 -- sent_stages untouched so the next tick retries it on the next channel.
 UPDATE deskbell.appointments
-SET sent_stages = CASE WHEN $2::boolean AND $3 <> 'voice'
+SET sent_stages = CASE WHEN $2::boolean AND $3 <> 'voice' AND NOT ($3 = ANY(sent_stages))
                        THEN array_append(sent_stages, $3) ELSE sent_stages END,
     voice_attempts = CASE WHEN $3 = 'voice' THEN voice_attempts + 1 ELSE voice_attempts END,
     status = CASE WHEN $2::boolean AND status = 'scheduled' THEN 'reminded' ELSE status END,
@@ -486,7 +516,10 @@ const rendered = renderTemplate(template, vars);
 // ---- 3. Channel ladder. Each rung is a full attempt plan; the loop below tries
 // them in order and stops at the first success.
 const ladder = [];
-const failed = [];
+// A redelivery arrives carrying the channel that failed to reach the handset.
+// Seeding it as already-failed keeps the ladder from resending on the number
+// that just bounced, which would learn the same thing a second time.
+const failed = Array.isArray(task.excludeChannels) ? [...task.excludeChannels] : [];
 for (let i = 0; i < 4; i++) {
   const pick = pickChannel(task.channels, contact, config, { now, failedChannels: failed, templateApproved: true });
   if (!pick.channel) break;
@@ -685,9 +718,11 @@ if (change?.messages?.length) {
   providerMessageId = m.id;
 }
 
-// Delivery-status callbacks are not customer replies. Acknowledge and stop.
+// Delivery receipts are not customer replies, but they are not noise either.
+// WhatsApp Cloud allows one webhook URL per app, so they arrive here whether we
+// want them to or not; hand them to workflow 11 instead of dropping them.
 if (!text && (body.MessageStatus || change?.statuses)) {
-  return [{ json: { skip: true, reason: 'status_callback' } }];
+  return [{ json: { skip: true, reason: 'status_callback', statusCallback: true, payload: body } }];
 }
 if (!from || text == null) {
   return [{ json: { skip: true, reason: 'unrecognized_payload' } }];
@@ -697,7 +732,9 @@ return [{ json: { skip: false, from: normalizePhone(from), text: String(text).tr
     { pos: [700, 380] });
 
   w.add('if', 'Is A Reply?', ifBool('={{ !$json.skip }}'), { pos: [920, 380] });
-  w.add('noOp', 'Ignore', {}, { pos: [1140, 560] });
+  w.add('if', 'Status Callback?', ifBool('={{ $json.statusCallback }}'), { pos: [1140, 620] });
+  w.add('execWorkflow', 'Forward To Receipts', callWorkflow(WF.receipts), { pos: [1360, 700], continueOnFail: true });
+  w.add('noOp', 'Ignore', {}, { pos: [1360, 560] });
 
   w.add('postgres', 'Find Contact & Appointment', sql(
     `SELECT c.id AS contact_id, c.first_name, c.name, c.phone, c.whatsapp, c.email,
@@ -987,7 +1024,9 @@ VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, $7);`,
   w.link('Inbound Message', 'Get Config');
   w.chain('Get Config', 'Normalize Inbound', 'Is A Reply?');
   w.link('Is A Reply?', 'Find Contact & Appointment', 0);
-  w.link('Is A Reply?', 'Ignore', 1);
+  w.link('Is A Reply?', 'Status Callback?', 1);
+  w.link('Status Callback?', 'Forward To Receipts', 0);
+  w.link('Status Callback?', 'Ignore', 1);
   w.chain('Find Contact & Appointment', 'Classify Intent', 'Log Inbound', 'Needs AI?');
   w.link('Needs AI?', 'Classify with Claude', 0);
   w.link('Needs AI?', 'Route Intent', 1);
@@ -1128,16 +1167,44 @@ return [{
 }];`), { pos: [1360, 380] });
 
   w.add('if', 'Should Text Back?', ifBool('={{ !$json.skip }}'), { pos: [1580, 380] });
-  w.add('noOp', 'Already Handled', {}, { pos: [1800, 540] });
-  w.add('execWorkflow', 'Send Text Back', callWorkflow(WF.dispatcher), { pos: [1800, 380], continueOnFail: true });
+  w.add('noOp', 'Already Handled', {}, { pos: [1800, 620] });
+
+  w.add('postgres', 'Claim Text Back', sql(
+    `-- The lead dedupe upstream is time-based and answers a different question.
+-- This is the same claim every other send makes, and it is what gives the
+-- text-back a provider_message_id a delivery receipt can be matched against.
+INSERT INTO deskbell.message_log
+  (idempotency_key, contact_id, stage, kind, direction, status, attempt)
+VALUES ($1, $2::bigint, 'missed-call', 'transactional', 'outbound', 'claimed', 1)
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING id;`,
+    '={{ $json.idempotencyKey }},{{ $json.contactId }}',
+  ), { pos: [1800, 380], ...withPg, alwaysOutputData: true });
+
+  w.add('code', 'Won The Claim?', jsCode(`${HEADER('deskbell/05 — one text-back per missed call, ever')}
+const claim = $input.first()?.json || {};
+const task = $('Build Text Back').first().json;
+if (!claim.id) {
+  console.log('deskbell/05: text-back already claimed elsewhere — not resending');
+  return [];
+}
+return [{ json: { ...task, messageLogId: claim.id } }];`), { pos: [2020, 380], alwaysOutputData: true });
+
+  w.add('execWorkflow', 'Send Text Back', callWorkflow(WF.dispatcher), { pos: [2240, 380], continueOnFail: true });
 
   w.add('postgres', 'Record Recovery', sql(
     `UPDATE deskbell.leads SET status = CASE WHEN $2::boolean THEN 'contacted' ELSE 'contact_failed' END,
    contacted_at = now() WHERE id = $1::bigint;
+UPDATE deskbell.message_log
+SET status = CASE WHEN deskbell.delivery_rank(status) > deskbell.delivery_rank($5)
+                  THEN status ELSE $5 END,
+    channel = $4, provider_message_id = $6, body = $7,
+    sent_at = CASE WHEN $2::boolean THEN now() END, settled_at = now()
+WHERE id = $8::bigint;
 INSERT INTO deskbell.events (type, contact_id, channel, payload)
 VALUES ('missed_call_texted', $3::bigint, $4, jsonb_build_object('leadId', $1::bigint, 'sent', $2::boolean));`,
-    '={{ $("Build Text Back").first().json.leadId }},{{ $json.sent }},{{ $("Build Text Back").first().json.contactId }},{{ $json.channel }}',
-  ), { pos: [2020, 380], ...withPg });
+    '={{ $("Build Text Back").first().json.leadId }},{{ $json.sent }},{{ $("Build Text Back").first().json.contactId }},{{ $json.channel }},{{ $json.sent ? "sent" : "failed" }},{{ $json.providerMessageId }},{{ $json.body }},{{ $("Won The Claim?").first().json.messageLogId }}',
+  ), { pos: [2460, 380], ...withPg });
 
   w.link('Twilio Call Status', 'Ack Twilio');
   w.link('Twilio Call Status', 'Get Config');
@@ -1145,9 +1212,9 @@ VALUES ('missed_call_texted', $3::bigint, $4, jsonb_build_object('leadId', $1::b
   w.link('Missed?', 'Upsert Caller & Lead', 0);
   w.link('Missed?', 'Not A Missed Call', 1);
   w.chain('Upsert Caller & Lead', 'Build Text Back', 'Should Text Back?');
-  w.link('Should Text Back?', 'Send Text Back', 0);
+  w.link('Should Text Back?', 'Claim Text Back', 0);
   w.link('Should Text Back?', 'Already Handled', 1);
-  w.link('Send Text Back', 'Record Recovery');
+  w.chain('Claim Text Back', 'Won The Claim?', 'Send Text Back', 'Record Recovery');
 
   w.note(
     '## 05 — Missed call recovery\n\nPoint your Twilio number\'s **status callback** at `/webhook/deskbell/call-status`.\n\n78% of customers buy from whoever replies first, so this path is deliberately short: detect, dedupe, text back. Commercial tools charge $40–300/month for exactly this.\n\n**Dedupe:** one lead per caller per hour. A customer redialling four times is one lost customer, not four text messages.\n\n**After-hours copy differs** — see `missedCallAfterHours` in the config templates.',
@@ -1484,15 +1551,20 @@ return $('Build Outreach Tasks').all().map(i => i.json)
   w.add('execWorkflow', 'Send Outreach', callWorkflow(WF.dispatcher), { pos: [2240, 400], continueOnFail: true });
 
   w.add('postgres', 'Settle Outreach', sql(
-    `UPDATE deskbell.message_log
-SET status = CASE WHEN $2::boolean THEN 'sent' ELSE 'failed' END,
-    channel = $3, body = $4, error_message = $5, sent_at = CASE WHEN $2::boolean THEN now() END, settled_at = now()
+    `-- provider_message_id is recorded here for the same reason it is in 02:
+-- it is the only handle a delivery receipt arrives with. Without it a review
+-- request or a recall is permanently unreconcilable.
+UPDATE deskbell.message_log
+SET status = CASE WHEN deskbell.delivery_rank(status) > deskbell.delivery_rank($9)
+                  THEN status ELSE $9 END,
+    channel = $3, body = $4, error_message = $5, provider_message_id = $10,
+    sent_at = CASE WHEN $2::boolean THEN now() END, settled_at = now()
 WHERE id = $1::bigint;
 UPDATE deskbell.appointments SET followup_sent_at = now()
 WHERE id = $6::bigint AND $2::boolean AND $7 = 'followup';
 INSERT INTO deskbell.events (type, appointment_id, contact_id, channel, payload)
 VALUES ($7 || '_sent', $6::bigint, $8::bigint, $3, jsonb_build_object('sent', $2::boolean));`,
-    '={{ $("For Each Outreach").first().json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.body }},{{ $json.error }},{{ $("For Each Outreach").first().json.appointmentId }},{{ $("For Each Outreach").first().json.stage }},{{ $("For Each Outreach").first().json.contactId }}',
+    '={{ $("For Each Outreach").first().json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.body }},{{ $json.error }},{{ $("For Each Outreach").first().json.appointmentId }},{{ $("For Each Outreach").first().json.stage }},{{ $("For Each Outreach").first().json.contactId }},{{ $json.sent ? "sent" : "failed" }},{{ $json.providerMessageId }}',
   ), { pos: [2460, 400], ...withPg });
 
   w.add('noOp', 'Outreach Complete', {}, { pos: [2240, 160] });
@@ -1619,13 +1691,18 @@ return recorded.map((r, i) => ({ json: { ...offers[i], offerId: r.offer_id, mess
   w.add('execWorkflow', 'Send Offer', callWorkflow(WF.dispatcher), { pos: [1800, 400], continueOnFail: true });
 
   w.add('postgres', 'Settle Offer', sql(
-    `UPDATE deskbell.message_log
-SET status = CASE WHEN $2::boolean THEN 'sent' ELSE 'failed' END,
-    channel = $3, body = $4, sent_at = CASE WHEN $2::boolean THEN now() END, settled_at = now()
+    `-- "First confirm wins" is only fair if the offer arrived. Recording the
+-- provider id lets workflow 11 tell a slow reply from an offer that never
+-- reached the phone, which is the difference between a queue and a lottery.
+UPDATE deskbell.message_log
+SET status = CASE WHEN deskbell.delivery_rank(status) > deskbell.delivery_rank($6)
+                  THEN status ELSE $6 END,
+    channel = $3, body = $4, provider_message_id = $7,
+    sent_at = CASE WHEN $2::boolean THEN now() END, settled_at = now()
 WHERE id = $1::bigint;
 UPDATE deskbell.waitlist SET status = CASE WHEN $2::boolean THEN 'offered' ELSE 'waiting' END
 WHERE id = $5::bigint;`,
-    '={{ $("For Each Offer").first().json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.body }},{{ $("For Each Offer").first().json.waitlistId }}',
+    '={{ $("For Each Offer").first().json.messageLogId }},{{ $json.sent }},{{ $json.channel }},{{ $json.body }},{{ $("For Each Offer").first().json.waitlistId }},{{ $json.sent ? "sent" : "failed" }},{{ $json.providerMessageId }}',
   ), { pos: [2020, 400], ...withPg });
 
   w.add('code', 'Offers Complete', jsCode(`${HEADER('deskbell/08 — summarise')}
@@ -1777,9 +1854,19 @@ define(() => {
 
   w.add('postgres', 'Today Schedule', sql(
     `SELECT a.id, a.start_at, a.status, a.service_name, a.value,
-       c.first_name, c.name, c.phone
+       c.first_name, c.name, c.phone,
+       coalesce(d.reached, 0) AS reached, coalesce(d.undelivered, 0) AS undelivered
 FROM deskbell.appointments a
 JOIN deskbell.contacts c ON c.id = a.contact_id
+LEFT JOIN LATERAL (
+  -- Did anything we sent about this appointment actually arrive? Without this
+  -- the unconfirmed list below cannot tell a customer who ignored us from a
+  -- phone number that has never once received a message.
+  SELECT count(*) FILTER (WHERE m.status IN ('delivered','read')) AS reached,
+         count(*) FILTER (WHERE m.status = 'undelivered')         AS undelivered
+  FROM deskbell.message_log m
+  WHERE m.appointment_id = a.id AND m.direction = 'outbound'
+) d ON true
 WHERE a.start_at >= date_trunc('day', now())
   AND a.start_at <  date_trunc('day', now()) + interval '1 day'
   AND a.status NOT IN ('cancelled', 'rescheduled')
@@ -1802,7 +1889,10 @@ GROUP BY type, channel;`,
   coalesce(sum(value) FILTER (WHERE status = 'no_show'), 0) AS lost_value,
   (SELECT count(*) FROM deskbell.human_tasks WHERE resolved_at IS NULL) AS open_tasks,
   (SELECT count(*) FROM deskbell.dead_letters WHERE created_at > now() - interval '1 day') AS errors_today,
-  (SELECT count(*) FROM deskbell.leads WHERE first_contact_at > now() - interval '7 days') AS missed_calls
+  (SELECT count(*) FROM deskbell.leads WHERE first_contact_at > now() - interval '7 days') AS missed_calls,
+  (SELECT count(*) FROM deskbell.message_log
+    WHERE direction = 'outbound' AND status = 'undelivered'
+      AND created_at > now() - interval '7 days') AS undelivered_week
 FROM deskbell.appointments
 WHERE start_at > now() - interval '7 days' AND start_at < now();`,
   ), { pos: [700, 480], ...withPg, alwaysOutputData: true });
@@ -1840,6 +1930,16 @@ const time = (iso) => new Intl.DateTimeFormat(config.business.locale || 'en', {
 
 const unconfirmed = today.filter(a => a.status !== 'confirmed');
 
+// "Unconfirmed" is two different problems wearing one label. Someone who was
+// reached and did not reply is a customer to chase. Someone a receipt says was
+// never reached is a wrong number in the booking system, and chasing them
+// harder achieves nothing — the fix is to correct the number.
+const notReachedSet = new Set(
+  unconfirmed.filter(a => Number(a.reached || 0) === 0 && Number(a.undelivered || 0) > 0).map(a => a.id),
+);
+const notReached = unconfirmed.filter(a => notReachedSet.has(a.id));
+const noReply = unconfirmed.filter(a => !notReachedSet.has(a.id));
+
 const lines = [
   \`Good morning. Here is \${config.business.name} today.\`,
   '',
@@ -1847,14 +1947,18 @@ const lines = [
   \`  Confirmed:   \${today.length - unconfirmed.length}\`,
   \`  Unconfirmed: \${unconfirmed.length}\${unconfirmed.length ? '  <- worth a look' : ''}\`,
   '',
-  ...(unconfirmed.length ? ['Not yet confirmed:',
-    ...unconfirmed.slice(0, 12).map(a => \`  \${time(a.start_at)}  \${a.name || a.first_name || a.phone}  (\${a.service_name})\`),
-    unconfirmed.length > 12 ? \`  ...and \${unconfirmed.length - 12} more\` : '', ''] : []),
+  ...(noReply.length ? ['Reached, no reply yet:',
+    ...noReply.slice(0, 12).map(a => \`  \${time(a.start_at)}  \${a.name || a.first_name || a.phone}  (\${a.service_name})\`),
+    noReply.length > 12 ? \`  ...and \${noReply.length - 12} more\` : '', ''] : []),
+  ...(notReached.length ? ['NEVER REACHED — the message did not arrive. Check the number:',
+    ...notReached.slice(0, 12).map(a => \`  \${time(a.start_at)}  \${a.name || a.first_name || a.phone}  \${a.phone || ''}\`),
+    notReached.length > 12 ? \`  ...and \${notReached.length - 12} more\` : '', ''] : []),
   'LAST 7 DAYS',
   \`  Reminders sent:     \${roi.remindersSent}\`,
   \`  Confirmations:      \${roi.confirmations} (\${Math.round(roi.confirmationRate * 100)}%)\`,
   \`  No-show rate:       \${Math.round(noShowRate * 100)}% (\${noShows} of \${total})\`,
   \`  Missed calls texted:\${' '}\${Number(outcome.missed_calls || 0)}\`,
+  \`  Never delivered:    \${Number(outcome.undelivered_week || 0)}\${Number(outcome.undelivered_week || 0) ? '  <- see deskbell.v_undelivered' : ''}\`,
   \`  Slots refilled:     \${roi.slotsRefilled}\`,
   '',
   'WHAT IT WAS WORTH',
@@ -1907,6 +2011,117 @@ ON CONFLICT (day) DO UPDATE SET metrics = EXCLUDED.metrics;`,
 });
 
 /* ================================================================== *
+ * 11 — Delivery receipts
+ * ================================================================== */
+
+define(() => {
+  const w = new Workflow('deskbell/11 Delivery Receipts', META);
+
+  // Twilio posts here directly — this is the StatusCallback URL workflow 03
+  // puts on every SMS it sends.
+  w.add('webhook', 'Message Status', webhookIn('deskbell/message-status'), { pos: [260, 300], webhookId: true });
+  w.add('respond', 'Ack Provider', { respondWith: 'text', responseBody: 'OK', options: {} }, { pos: [480, 140] });
+
+  // WhatsApp Cloud allows exactly one webhook URL per app, so its receipts
+  // arrive at deskbell/inbound with the replies. Workflow 04 forwards them.
+  w.add('execTrigger', 'Forwarded From 04', {}, { pos: [260, 520] });
+
+  w.add('code', 'Normalize Receipts', jsCode(`${HEADER('deskbell/11 — one shape from every provider idea of a receipt')}
+const receipts = [];
+
+for (const item of $input.all()) {
+  const body = item.json.body || item.json.payload || item.json;
+
+  // Twilio: form-encoded, one status per POST.
+  if (body.MessageSid || body.SmsSid) {
+    receipts.push({
+      providerMessageId: body.MessageSid || body.SmsSid,
+      status: normalizeDeliveryStatus(body.MessageStatus || body.SmsStatus),
+      providerStatus: String(body.MessageStatus || body.SmsStatus || ''),
+      errorCode: body.ErrorCode != null ? String(body.ErrorCode) : '',
+      errorMessage: body.ErrorMessage ? String(body.ErrorMessage) : '',
+    });
+  }
+
+  // WhatsApp Cloud: a change feed that can carry several statuses at once.
+  for (const st of body.entry?.[0]?.changes?.[0]?.value?.statuses || []) {
+    const err = st.errors?.[0] || {};
+    receipts.push({
+      providerMessageId: st.id,
+      status: normalizeDeliveryStatus(st.status),
+      providerStatus: String(st.status || ''),
+      errorCode: err.code != null ? String(err.code) : '',
+      errorMessage: err.title || err.message || '',
+    });
+  }
+}
+
+// A vocabulary we do not recognise is dropped, not guessed at. Marking a
+// message delivered on the strength of a word we have never seen is worse
+// than admitting we do not know.
+const usable = receipts.filter(r => r.providerMessageId && r.status);
+const dropped = receipts.length - usable.length;
+if (dropped) console.log(\`deskbell/11: \${dropped} receipt(s) with no id or an unrecognised status\`);
+return usable.map(r => ({ json: r }));`), { pos: [700, 300] });
+
+  w.add('postgres', 'Apply Receipt', sql(
+    `-- Receipts arrive out of order, more than once, and occasionally for a
+-- message this row already knows more about: Twilio's "sent" and "delivered"
+-- callbacks routinely land the wrong way round. delivery_rank() makes the
+-- write monotonic, so a stale callback updates nothing rather than walking a
+-- delivered message back to sent.
+UPDATE deskbell.message_log
+SET status             = $2,
+    provider_status    = $3,
+    provider_status_at = now(),
+    delivered_at       = CASE WHEN $2 IN ('delivered','read')
+                              THEN coalesce(delivered_at, now()) ELSE delivered_at END,
+    error_code         = coalesce(nullif($4, ''), error_code),
+    error_message      = coalesce(nullif($5, ''), error_message)
+WHERE provider_message_id = $1
+  AND deskbell.delivery_rank($2) > deskbell.delivery_rank(status)
+RETURNING id, appointment_id, contact_id, stage, channel, status;`,
+    '={{ $json.providerMessageId }},{{ $json.status }},{{ $json.providerStatus }},{{ $json.errorCode }},{{ $json.errorMessage }}',
+  ), { pos: [920, 300], ...withPg, alwaysOutputData: true });
+
+  w.add('code', 'Anything Advanced?', jsCode(`${HEADER('deskbell/11 — only record receipts that actually told us something new')}
+const rows = $input.all().map(i => i.json).filter(r => r.id);
+
+// No row advanced. That is ordinary traffic: a duplicate callback, one that
+// arrived late, or one for a message some other instance sent. Nothing to do.
+if (!rows.length) return [];
+
+return rows.map(r => ({
+  json: {
+    appointmentId: r.appointment_id,
+    contactId: r.contact_id,
+    stage: r.stage,
+    channel: r.channel,
+    status: r.status,
+    reached: deliveryOutcome(r.status),
+    eventType: 'message_' + r.status,
+  },
+}));`), { pos: [1140, 300], alwaysOutputData: true });
+
+  w.add('postgres', 'Log Delivery Event', sql(
+    `INSERT INTO deskbell.events (type, appointment_id, contact_id, channel, payload)
+VALUES ($1, $2::bigint, $3::bigint, $4, jsonb_build_object('stage', $5::text, 'reached', $6::text));`,
+    '={{ $json.eventType }},{{ $json.appointmentId }},{{ $json.contactId }},{{ $json.channel }},{{ $json.stage }},{{ $json.reached }}',
+  ), { pos: [1360, 300], ...withPg });
+
+  w.link('Message Status', 'Ack Provider');
+  w.link('Message Status', 'Normalize Receipts');
+  w.link('Forwarded From 04', 'Normalize Receipts');
+  w.chain('Normalize Receipts', 'Apply Receipt', 'Anything Advanced?', 'Log Delivery Event');
+
+  w.note(
+    '## 11 — Delivery receipts\n\n`sent` means a provider accepted the payload. It is not the same fact as "the phone showed it", and a no-show engine that cannot separate them cannot tell **"she read it and ignored us"** from **"it never arrived"** — opposite problems with opposite fixes.\n\n### Wiring\n- **Twilio** — nothing to do. Workflow 03 already sets `StatusCallback` to `/webhook/deskbell/message-status` on every SMS.\n- **WhatsApp Cloud** — one webhook URL per app, so its receipts land on `/webhook/deskbell/inbound` with the replies. Workflow 04 recognises them and calls this workflow.\n\n### Out-of-order callbacks\nProviders do not order their webhooks. Every write goes through `deskbell.delivery_rank()`, so a late `sent` cannot undo a `delivered`, and a duplicate updates nothing.\n\n### What it changes\nAn `undelivered` receipt un-does the "already sent" mark in workflow 02, so the stage is retried **on a different channel**. The daily digest splits its unconfirmed list into *reached, no reply* and *never reached* — the second is a wrong number, not a reluctant customer.',
+    [640, -220], [660, 520],
+  );
+  return w;
+});
+
+/* ================================================================== *
  * Emit
  * ================================================================== */
 
@@ -1917,6 +2132,7 @@ const slugs = [
   '00-config', '01-appointment-sync', '02-reminder-scheduler', '03-message-dispatcher',
   '04-inbound-handler', '05-missed-call-recovery', '06-voice-agent-vapi',
   '07-followup-recall', '08-waitlist-gapfill', '09-error-handler', '10-daily-digest',
+  '11-delivery-receipts',
 ];
 
 if (slugs.length !== workflows.length) {

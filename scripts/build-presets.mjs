@@ -121,6 +121,12 @@ const BASE = {
     retryBackoffSeconds: [30, 300, 1800],
     deadLetterAfterAttempts: 3,
     alertChannel: 'email',
+    // How many times a reminder stage may be re-sent after the last attempt is
+    // known not to have reached the customer — the provider refused it, or a
+    // delivery receipt said it never arrived. The retry goes out on a different
+    // channel. Set to 0 to never retry a stage; above 1 you are mostly paying
+    // to learn the same thing about a number that is simply wrong.
+    maxRedeliveryAttempts: 1,
   },
 
   ai: {

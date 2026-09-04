@@ -9,7 +9,7 @@ Reduce no-shows, text back every missed call, and fill cancelled slots — self-
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![n8n](https://img.shields.io/badge/n8n-%3E%3D1.40-ea4b71)](https://n8n.io)
-[![Tests](https://img.shields.io/badge/tests-63%20passing-brightgreen)](tests/core.test.mjs)
+[![Tests](https://img.shields.io/badge/tests-78%20passing-brightgreen)](tests/core.test.mjs)
 [![CI](https://github.com/kapoordeepanshu/DeskBell/actions/workflows/ci.yml/badge.svg)](https://github.com/kapoordeepanshu/DeskBell/actions)
 
 [Quickstart](#quickstart-10-minutes) · [How it works](#how-it-works) · [Compare](#how-deskbell-compares) · [FAQ](#faq) · [Docs](docs/setup.md)
@@ -37,6 +37,7 @@ Commercial tools do this for **$40–300/month**, per location, with your custom
 - 📅 **Multi-stage appointment reminders** — T-7d → T-24h → T-3h, over WhatsApp, SMS or email
 - ✅ **Two-way confirmations** — customers reply `YES` / `NO` / `CANCEL` and your calendar updates itself
 - 📞 **Missed-call text-back** — an unanswered call gets an SMS within seconds, with your booking link
+- 📬 **Delivery receipts** — knows whether the message reached the phone, and re-sends on another channel when it didn't
 - 🎙️ **AI voice reminders** — [VAPI](https://vapi.ai) calls high-value bookings that never replied
 - 🔁 **Waitlist gap-fill** — a cancellation is instantly offered to people waiting
 - ⭐ **Review requests & recall** — after the visit, and again when they're due back
@@ -56,8 +57,9 @@ Commercial tools do this for **$40–300/month**, per location, with your custom
                            │  Idempotency keys    │                 │
  ┌────────────────┐        │  State machine       │◀────────────────┘
  │ Missed call    │───────▶│  Fallback ladder     │   replies: CONFIRM / CANCEL
- │ (Twilio hook)  │        └──────────┬───────────┘             STOP / free text
- └────────────────┘                   │
+ │ (Twilio hook)  │        │  Delivery receipts   │             STOP / free text
+ └────────────────┘        └──────────┬───────────┘   receipts: delivered / read
+                                      │                         / undelivered
                                       ▼
                       ┌────────────────────────────────┐
                       │ Waitlist gap-fill · Review     │
@@ -65,7 +67,7 @@ Commercial tools do this for **$40–300/month**, per location, with your custom
                       └────────────────────────────────┘
 ```
 
-Eleven n8n workflows, driven by **one config file**. Details in [`docs/architecture.md`](docs/architecture.md).
+Twelve n8n workflows, driven by **one config file**. Details in [`docs/architecture.md`](docs/architecture.md).
 
 ## How DeskBell compares
 
@@ -79,11 +81,12 @@ I searched GitHub before building this. Here is the honest landscape.
 | STOP / consent / quiet hours | ❌ | ✅ | ✅ |
 | Channel fallback (WhatsApp→SMS→voice) | ❌ | Partial | ✅ |
 | Missed-call text-back | ❌ | ✅ | ✅ |
+| Knows if the message actually arrived | ❌ | ✅ | ✅ |
 | Waitlist gap-fill | ❌ | Sometimes | ✅ |
 | Works for any vertical | ❌ hardcoded | Per-industry pricing | ✅ config presets |
 | Error handling & alerting | ❌ | ✅ | ✅ |
 | Shows you the ROI | ❌ | ✅ | ✅ |
-| Unit-tested logic | ❌ | n/a | ✅ 63 tests |
+| Unit-tested logic | ❌ | n/a | ✅ 78 tests |
 
 Every appointment-reminder repo I found on GitHub has **0–3 stars** and is a single-workflow demo hardcoded to one clinic. The template *collections* have 24k stars but ship no product thinking at all.
 
@@ -96,7 +99,7 @@ git clone https://github.com/kapoordeepanshu/DeskBell.git
 cd DeskBell
 cp .env.example .env      # add your provider keys
 docker compose up -d      # n8n + Postgres on http://localhost:5678
-npm run import            # create and cross-link all 11 workflows
+npm run import            # create and cross-link all 12 workflows
 ```
 
 Then:
@@ -148,16 +151,17 @@ Switching a dental clinic to a barbershop is a preset swap: the ladder shortens 
 | 08 | Waitlist Gap-fill | Sub-workflow | Cancellation → offers the slot, first confirm wins |
 | 09 | Error Handler | Error trigger | Dead-letters failures, alerts you, suppresses storms |
 | 10 | Daily Digest | Daily 07:30 | Today's unconfirmed list + revenue protected |
+| 11 | Delivery Receipts | Webhook + sub | What actually reached the phone, and what didn't |
 
 ## Verified, not just published
 
 ```
 $ npm test
-# tests 63 · pass 63 · fail 0
+# tests 78 · pass 78 · fail 0
 
 $ npm run validate
-11 workflows, 150 nodes, 32 Code nodes validated — 0 error(s), 0 warning(s).
-12 tables, 3 views in schema; 34 SQL nodes checked — 0 error(s).
+12 workflows, 162 nodes, 35 Code nodes validated — 0 error(s), 0 warning(s).
+12 tables, 4 views, 1 functions in schema; 37 SQL nodes checked — 0 error(s).
 ```
 
 The engine lives in [`lib/core.js`](lib/core.js) as pure functions and is **inlined into the n8n Code nodes at build time**, so the tested code and the shipped code are the same code. CI fails if they drift, and applies the schema to a real Postgres twice to prove it's idempotent.
@@ -183,6 +187,26 @@ No, and that's enforced by the database rather than by hopeful code.
 Every send claims a unique key — `appointment_id|stage` — with `INSERT ... ON CONFLICT DO NOTHING` **before** any provider is contacted. A re-run, an overlapping schedule tick, or a restart mid-flight inserts nothing, gets nothing back, and sends nothing.
 
 If you ever see a duplicate, [open an issue](https://github.com/kapoordeepanshu/DeskBell/issues) — it takes priority over everything else.
+
+</details>
+
+<details>
+<summary><b>Does it know whether the message actually arrived?</b></summary>
+<br>
+
+Yes, and it acts on the answer.
+
+`sent` only ever meant "Twilio or Meta accepted the payload". A no-show engine that stops there cannot tell **"she read it and didn't reply"** apart from **"it never arrived"** — and those are opposite problems with opposite fixes.
+
+So DeskBell collects delivery receipts. Twilio posts them to workflow 11; WhatsApp Cloud allows one webhook URL per app, so its receipts come in with the replies and workflow 04 hands them over. Three things change as a result:
+
+- A message a receipt reports as **undelivered** un-does the "already sent" mark, and the stage is retried **on a different channel** rather than being silently written off.
+- The daily digest splits its unconfirmed list into *reached, no reply* — a customer to chase — and *never reached*, which is a wrong number in your booking system and no amount of chasing will fix it.
+- `SELECT * FROM deskbell.v_undelivered;` is your fault list of numbers to correct at the source.
+
+Receipts arrive out of order and more than once — Twilio's `sent` and `delivered` webhooks routinely land the wrong way round — so every status write is compared through `deskbell.delivery_rank()`. A late receipt can't walk a delivered message backwards.
+
+Channels differ in what they'll tell you: SMS reports delivered/undelivered, WhatsApp adds read, email reports nothing. A message on a channel with no receipts stays `sent`, and DeskBell reads that as **unknown** everywhere — not as delivered.
 
 </details>
 
@@ -269,9 +293,9 @@ DeskBell never guesses at a cancellation. Wrongly cancelling a booking costs far
 <summary><b>What if a message fails to send?</b></summary>
 <br>
 
-The channel ladder tries the next channel — WhatsApp → SMS → voice — within the same run.
+The channel ladder tries the next channel — WhatsApp → SMS → voice — within the same run, so most failures are recovered before the scheduler ever sees a result. Permanent failures (invalid number, landline) stop the ladder immediately rather than burning three channels to learn the same thing.
 
-A failed send deliberately does **not** mark the reminder stage as done, so the next 15-minute tick retries it. Permanent failures (invalid number, landline) stop the ladder immediately rather than burning three channels to learn the same thing.
+What's left over — every channel refused, or the message accepted and then reported undelivered — gets a later attempt. That one needs its own idempotency key, since the first attempt already holds `appointment|stage`: the retry claims `appointment|stage|r1`, goes out on a channel that hasn't failed yet, and stops at `reliability.maxRedeliveryAttempts` (default 1). Past that the stage reports `redelivery_exhausted` rather than quietly looking due forever.
 
 Everything lands in `dead_letters` classified as retryable or permanent, and you get one email per workflow per 30 minutes — not 200.
 
